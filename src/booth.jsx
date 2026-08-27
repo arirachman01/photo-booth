@@ -27,6 +27,10 @@ const SANS = '"Jost", sans-serif';
 
 const TOTAL_SHOTS = 1;
 
+/* max width/height (px) a frame PNG is downscaled to before use — keeps
+   canvas rendering fast even if someone drops in a huge source file */
+const MAX_FRAME_IMG_DIM = 1600;
+
 /* ================= shared step header atoms ================= */
 function StepEyebrow({ children }) {
   return (
@@ -247,6 +251,7 @@ const BUILTIN_FRAME_SPECS = [
     cardColor: "#0c0a08",
   },
 ];
+// console.log(BUILTIN_FRAME_SPECS);
 
 /* builtin templates are generated the same way as user-made frames, just
    flagged isCustom:false so they don't show the "SENDIRI" tag / delete icon */
@@ -376,6 +381,88 @@ function detectTransparentRegions(
   } catch (e) {
     console.log(e);
     return [];
+  }
+}
+
+/* ================= folder-based frame templates (Vite) =================
+   Drop any transparent PNG into src/assets/frames/ and it shows up
+   automatically as a built-in frame template — no code changes needed.
+   Transparent areas are auto-detected the same way as a "Buat Bingkai
+   Sendiri" upload, so photos land in the right spot on their own. */
+const FRAME_FOLDER_MODULES = import.meta.glob("./assets/frames/*.png", {
+  eager: true,
+});
+
+function loadImageAsync(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+function frameNameFromPath(path) {
+  const file = path
+    .split("/")
+    .pop()
+    .replace(/\.png$/i, "");
+  return file.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/* mirrors handleBuilderImageSelect's pipeline (downscale → cache → detect
+   transparent holes) but runs against a bundled asset URL instead of a
+   FileReader result, so folder frames behave identically to uploaded ones */
+async function buildFolderFrameSpec(path, url) {
+  try {
+    const probe = await loadImageAsync(url);
+    let width = probe.naturalWidth,
+      height = probe.naturalHeight;
+    let finalUrl = url;
+    if (Math.max(width, height) > MAX_FRAME_IMG_DIM) {
+      const scale = MAX_FRAME_IMG_DIM / Math.max(width, height);
+      const w = Math.round(width * scale),
+        h = Math.round(height * scale);
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      c.getContext("2d").drawImage(probe, 0, 0, w, h);
+      finalUrl = c.toDataURL("image/png");
+      width = w;
+      height = h;
+    }
+    const cached = await loadImageAsync(finalUrl);
+    frameImageCache.set(finalUrl, cached);
+    const regions = detectTransparentRegions(cached, width, height);
+    const hasHole = regions.length > 0;
+    let holeX = 0,
+      holeY = 0,
+      holeW = width,
+      holeH = height;
+    if (hasHole) {
+      holeX = Math.min(...regions.map((r) => r.x));
+      holeY = Math.min(...regions.map((r) => r.y));
+      holeW = Math.max(...regions.map((r) => r.x + r.w)) - holeX;
+      holeH = Math.max(...regions.map((r) => r.y + r.h)) - holeY;
+    }
+    return {
+      id: `folder-${path}`,
+      name: frameNameFromPath(path),
+      type: "image",
+      imageDataUrl: finalUrl,
+      imgW: width,
+      imgH: height,
+      hasHole,
+      holeX,
+      holeY,
+      holeW,
+      holeH,
+      holes: regions,
+      count: hasHole ? Math.max(1, Math.min(6, regions.length)) : 1,
+    };
+  } catch (e) {
+    console.log("Gagal memuat bingkai dari folder:", path, e);
+    return null;
   }
 }
 
@@ -639,6 +726,10 @@ export default function LumiereBooth() {
   const [cameraErrorMsg, setCameraErrorMsg] = useState("");
   const [retakeIndex, setRetakeIndex] = useState(null); // index of a single photo being retaken, or null for normal capture flow
 
+  /* frame templates auto-loaded from src/assets/frames/*.png (see
+     FRAME_FOLDER_MODULES) — treated as built-in, not user-editable */
+  const [folderTemplates, setFolderTemplates] = useState([]);
+
   /* user-created custom frame templates (persisted via window.storage) */
   const [customTemplates, setCustomTemplates] = useState([]); // array of specs
   const [builderOpen, setBuilderOpen] = useState(false);
@@ -658,12 +749,36 @@ export default function LumiereBooth() {
   const templates = useMemo(
     () => [
       ...BUILTIN_TEMPLATES,
+      ...folderTemplates,
       ...customTemplates.map((spec) =>
         buildCustomTemplate(spec, () => setAssetTick((t) => t + 1)),
       ),
     ],
-    [customTemplates],
+    [folderTemplates, customTemplates],
   );
+
+  /* load every PNG dropped into src/assets/frames/ once on mount */
+  useEffect(() => {
+    let cancelled = false;
+    const entries = Object.entries(FRAME_FOLDER_MODULES);
+    if (entries.length === 0) return;
+    (async () => {
+      const results = await Promise.all(
+        entries.map(([path, mod]) => buildFolderFrameSpec(path, mod.default)),
+      );
+      if (cancelled) return;
+      const specs = results.filter(Boolean);
+      setFolderTemplates(
+        specs.map((spec) => ({
+          ...buildCustomTemplate(spec),
+          isCustom: false,
+        })),
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
@@ -698,6 +813,8 @@ export default function LumiereBooth() {
   useEffect(() => {
     templatesRef.current = templates;
   }, [templates]);
+
+  console.log(templates);
 
   useEffect(() => {
     let cancelled = false;
@@ -1319,7 +1436,6 @@ export default function LumiereBooth() {
   }
 
   /* ================= custom frame builder ================= */
-  const MAX_FRAME_IMG_DIM = 1600;
   function resetBuilderForm() {
     setBuilderName("");
     setBuilderLayout("column");
