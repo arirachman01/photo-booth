@@ -1591,7 +1591,7 @@ export default function LumiereBooth() {
       `}</style>
 
       <div
-        className="w-full max-w-220 min-h-200 flex flex-col relative md:rounded-2xl md:overflow-hidden"
+        className="w-full max-w-220 min-h-dvh lg:min-h-200 flex flex-col relative md:rounded-2xl md:overflow-hidden"
         style={{ background: COLORS.bg, boxShadow: "0 0 60px rgba(0,0,0,.12)" }}
       >
         {/* ============ DEKORASI SUDUT BERTEMA LAUT ============ */}
@@ -1927,7 +1927,7 @@ export default function LumiereBooth() {
             </div>
 
             <div
-              className="relative w-150 shrink-0 aspect-3/4 md:aspect-16/10 mx-auto rounded-md"
+              className="relative lg:w-150 shrink-0 aspect-3/4 md:aspect-16/10 mx-auto rounded-md"
               style={{
                 background: "#000",
                 overflow: "hidden",
@@ -2235,7 +2235,7 @@ export default function LumiereBooth() {
           <section className="flex flex-col flex-1 px-5 pt-6.5 pb-7 min-h-0">
             <StepEyebrow>Langkah 6 dari {stepOrder.length}</StepEyebrow>
             <StepTitle>Pilih Bingkai &amp; Foto</StepTitle>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <div
                 className="p-3.5"
                 style={{
@@ -2244,21 +2244,22 @@ export default function LumiereBooth() {
                 }}
               >
                 <div
-                  className="w-100 flex items-center justify-center"
+                  className="lg:w-100 w-50 flex items-center justify-center m-auto"
                   style={{ background: COLORS.bgSoft }}
                 >
                   <canvas
                     ref={mainCanvasRef}
-                    className="w-100 h-auto block"
-                    style={{ touchAction: "none", cursor: "grab" }}
+                    className="lg:w-100 w-50 h-auto block m-auto"
+                    style={{
+                      touchAction: "none",
+                      cursor: "grab",
+                      margin: "auto",
+                    }}
                   />
                 </div>
               </div>
 
-              <div
-                className="flex flex-col gap-2.5 pt-4 pb-4 overflow-y-auto h-dvh"
-               
-              >
+              <div className="flex flex-col gap-2.5 pt-4 pb-4 overflow-y-auto h-80 lg:h-dvh">
                 <button
                   onClick={openBuilder}
                   className="w-full flex items-center justify-center gap-2 p-3 text-center cursor-pointer"
