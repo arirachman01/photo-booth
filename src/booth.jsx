@@ -25,7 +25,7 @@ const COLORS = {
 const SERIF = '"Cormorant Garamond", serif';
 const SANS = '"Jost", sans-serif';
 
-const TOTAL_SHOTS = 6;
+const TOTAL_SHOTS = 1;
 
 /* ================= shared step header atoms ================= */
 function StepEyebrow({ children }) {
@@ -1594,44 +1594,6 @@ export default function LumiereBooth() {
         className="w-full max-w-220 min-h-dvh lg:min-h-200 flex flex-col relative md:rounded-2xl md:overflow-hidden"
         style={{ background: COLORS.bg, boxShadow: "0 0 60px rgba(0,0,0,.12)" }}
       >
-        {/* ============ DEKORASI SUDUT BERTEMA LAUT ============ */}
-        {/* ombak — pojok kiri atas */}
-        <svg
-          viewBox="0 0 40 40"
-          className="absolute top-3 left-3 w-6 h-6 pointer-events-none"
-          style={{ opacity: 0.85, zIndex: 5 }}
-          fill="none"
-        >
-          <path
-            d="M3 15c3-4 7-4 10 0s7 4 10 0 7-4 10 0"
-            stroke="#111111"
-            strokeWidth="2"
-            strokeLinecap="round"
-          />
-          <path
-            d="M3 23c3-4 7-4 10 0s7 4 10 0 7-4 10 0"
-            stroke="#111111"
-            strokeWidth="2"
-            strokeLinecap="round"
-            opacity="0.5"
-          />
-        </svg>
-
-        {/* ikan kecil — pojok kanan atas */}
-        <svg
-          viewBox="0 0 40 40"
-          className="absolute top-3 right-3 w-6 h-6 pointer-events-none"
-          style={{ opacity: 0.85, zIndex: 5 }}
-          fill="none"
-        >
-          <path
-            d="M8 20c4-6 14-8 20-4-2 2-2 6 0 8-6 4-16 2-20-4Z"
-            fill="#111111"
-          />
-          <path d="M8 20 3 16v8l5-4Z" fill="#111111" />
-          <circle cx="23" cy="18" r="1.3" fill="#ffffff" />
-        </svg>
-
         {/* ============ TOPBAR ============ */}
         <div
           className="flex items-center justify-between px-4.5 py-4 shrink-0"
@@ -2232,34 +2194,22 @@ export default function LumiereBooth() {
 
         {/* ============ SCREEN 4: FRAME / EDITOR ============ */}
         {step === "frame" && (
-          <section className="flex flex-col flex-1 px-5 pt-6.5 pb-7 min-h-0">
+          <section className="flex flex-col flex-1 px-5 min-h-0">
             <StepEyebrow>Langkah 6 dari {stepOrder.length}</StepEyebrow>
             <StepTitle>Pilih Bingkai &amp; Foto</StepTitle>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div
-                className="p-3.5"
-                style={{
-                  background: COLORS.panel,
-                  border: `1px solid ${COLORS.panelLine}`,
-                }}
-              >
-                <div
-                  className="lg:w-100 w-50 flex items-center justify-center m-auto"
-                  style={{ background: COLORS.bgSoft }}
-                >
-                  <canvas
-                    ref={mainCanvasRef}
-                    className="lg:w-100 w-50 h-auto block m-auto"
-                    style={{
-                      touchAction: "none",
-                      cursor: "grab",
-                      margin: "auto",
-                    }}
-                  />
-                </div>
+              <div className="lg:w-100 w-50 flex items-center justify-center m-auto">
+                <canvas
+                  ref={mainCanvasRef}
+                  className="lg:w-100 w-50 h-auto block m-auto"
+                  style={{
+                    touchAction: "none",
+                    cursor: "grab",
+                    margin: "auto",
+                  }}
+                />
               </div>
-
-              <div className="flex flex-col gap-2.5 pt-4 pb-4 overflow-y-auto h-80 lg:h-dvh">
+              <div>
                 <button
                   onClick={openBuilder}
                   className="w-full flex items-center justify-center gap-2 p-3 text-center cursor-pointer"
@@ -2285,98 +2235,99 @@ export default function LumiereBooth() {
                     Buat Bingkai Sendiri
                   </span>
                 </button>
-
-                {templates.map((T) => {
-                  const active = T.id === templateId;
-                  return (
-                    <button
-                      key={T.id}
-                      onClick={() => handleTemplateClick(T)}
-                      className="w-full flex items-center gap-3 p-2.5 text-left cursor-pointer"
-                      style={{
-                        background: active
-                          ? "rgba(17,17,17,0.06)"
-                          : "transparent",
-                        border: `1px solid ${active ? COLORS.gold : COLORS.panelLine}`,
-                        borderRadius: "10px",
-                      }}
-                    >
-                      <div
-                        className="shrink-0 w-17.5 h-17.5 flex items-center justify-center overflow-hidden"
+                <div className="mt-5 flex flex-col gap-2.5 overflow-y-auto h-80 lg:h-150">
+                  {templates.map((T) => {
+                    const active = T.id === templateId;
+                    return (
+                      <button
+                        key={T.id}
+                        onClick={() => handleTemplateClick(T)}
+                        className="w-full flex items-center gap-3 p-2.5 text-left cursor-pointer"
                         style={{
-                          background: COLORS.bgSoft,
-                          border: `1px solid ${COLORS.panelLine}`,
+                          background: active
+                            ? "rgba(17,17,17,0.06)"
+                            : "transparent",
+                          border: `1px solid ${active ? COLORS.gold : COLORS.panelLine}`,
+                          borderRadius: "10px",
                         }}
                       >
-                        <canvas
-                          ref={(el) => {
-                            templateChipRefs.current[T.id] = el;
-                          }}
-                          className="block"
-                          style={{
-                            width: "100%",
-                            height: "100%",
-                            objectFit: "contain",
-                          }}
-                        />
-                      </div>
-                      <div className="flex-1 min-w-0">
                         <div
+                          className="shrink-0 w-17.5 h-17.5 flex items-center justify-center overflow-hidden"
                           style={{
-                            fontFamily: SERIF,
-                            fontSize: 15.5,
-                            color: active ? COLORS.goldSoft : COLORS.ivory,
+                            background: COLORS.bgSoft,
+                            border: `1px solid ${COLORS.panelLine}`,
                           }}
                         >
-                          {T.name}
+                          <canvas
+                            ref={(el) => {
+                              templateChipRefs.current[T.id] = el;
+                            }}
+                            className="block"
+                            style={{
+                              width: "100%",
+                              height: "100%",
+                              objectFit: "contain",
+                            }}
+                          />
                         </div>
-                        <div
-                          className="mt-0.5 flex items-center gap-1.5"
-                          style={{
-                            fontSize: 11,
-                            letterSpacing: "0.03em",
-                            color: COLORS.muted,
-                          }}
-                        >
-                          {T.meta}
-                          {T.isCustom && (
-                            <span
-                              className="px-1.5 py-0.5"
-                              style={{
-                                fontSize: 9,
-                                letterSpacing: "0.05em",
-                                color: COLORS.goldSoft,
-                                border: `1px solid ${COLORS.panelLine}`,
-                              }}
-                            >
-                              SENDIRI
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      {T.isCustom && (
-                        <span
-                          role="button"
-                          onClick={(e) => handleDeleteCustomTemplate(e, T.id)}
-                          className="shrink-0 p-2 cursor-pointer"
-                          aria-label="Hapus bingkai"
-                        >
-                          <svg
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            strokeWidth="1.8"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            className="w-4 h-4"
-                            style={{ stroke: COLORS.muted }}
+                        <div className="flex-1 min-w-0">
+                          <div
+                            style={{
+                              fontFamily: SERIF,
+                              fontSize: 15.5,
+                              color: active ? COLORS.goldSoft : COLORS.ivory,
+                            }}
                           >
-                            <path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-8 0 1 13a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-13" />
-                          </svg>
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
+                            {T.name}
+                          </div>
+                          <div
+                            className="mt-0.5 flex items-center gap-1.5"
+                            style={{
+                              fontSize: 11,
+                              letterSpacing: "0.03em",
+                              color: COLORS.muted,
+                            }}
+                          >
+                            {T.meta}
+                            {T.isCustom && (
+                              <span
+                                className="px-1.5 py-0.5"
+                                style={{
+                                  fontSize: 9,
+                                  letterSpacing: "0.05em",
+                                  color: COLORS.goldSoft,
+                                  border: `1px solid ${COLORS.panelLine}`,
+                                }}
+                              >
+                                SENDIRI
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        {T.isCustom && (
+                          <span
+                            role="button"
+                            onClick={(e) => handleDeleteCustomTemplate(e, T.id)}
+                            className="shrink-0 p-2 cursor-pointer"
+                            aria-label="Hapus bingkai"
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              strokeWidth="1.8"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="w-4 h-4"
+                              style={{ stroke: COLORS.muted }}
+                            >
+                              <path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2m-8 0 1 13a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2l1-13" />
+                            </svg>
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
             <div
