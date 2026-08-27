@@ -25,7 +25,7 @@ const COLORS = {
 const SERIF = '"Cormorant Garamond", serif';
 const SANS = '"Jost", sans-serif';
 
-const TOTAL_SHOTS = 1;
+const TOTAL_SHOTS = 6;
 
 /* max width/height (px) a frame PNG is downscaled to before use — keeps
    canvas rendering fast even if someone drops in a huge source file */
