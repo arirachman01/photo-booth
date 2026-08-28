@@ -960,7 +960,6 @@ export default function LumiereBooth() {
     if (step === "filter" || step === "start" || step === "payment") {
       clearSessionTimer();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
 
   useEffect(() => {
@@ -978,6 +977,7 @@ export default function LumiereBooth() {
     sessionExpiredRef.current = true;
     clearSessionTimer();
     stopCamera();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCountdownRunning(false);
     setCountdownDisplay("");
     setRetakeIndex(null);
@@ -1512,6 +1512,7 @@ export default function LumiereBooth() {
     setBuilderImageError("");
   }
 
+  // eslint-disable-next-line no-unused-vars
   function openBuilder() {
     resetBuilderForm();
     setBuilderOpen(true);
