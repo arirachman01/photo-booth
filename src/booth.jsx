@@ -7,6 +7,7 @@ import {
   AlertCircle,
   QrCode,
   Sparkles,
+  Clock,
 } from "lucide-react";
 
 const COLORS = {
@@ -26,6 +27,18 @@ const SERIF = '"Cormorant Garamond", serif';
 const SANS = '"Jost", sans-serif';
 
 const TOTAL_SHOTS = 6;
+
+/* total session time (in seconds) from clicking "Mulai Sekarang" until the
+   process must be finished — if it runs out mid-flow, whatever photos have
+   already been taken are used to auto-finish the session */
+const SESSION_DURATION_SEC = 5 * 60;
+
+function formatSessionTime(totalSeconds) {
+  const s = Math.max(0, totalSeconds);
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${String(rem).padStart(2, "0")}`;
+}
 
 /* max width/height (px) a frame PNG is downscaled to before use — keeps
    canvas rendering fast even if someone drops in a huge source file */
@@ -725,6 +738,12 @@ export default function LumiereBooth() {
   const [cameraStatus, setCameraStatus] = useState("idle"); // idle | requesting | ready | error
   const [cameraErrorMsg, setCameraErrorMsg] = useState("");
   const [retakeIndex, setRetakeIndex] = useState(null); // index of a single photo being retaken, or null for normal capture flow
+  const [sessionSecondsLeft, setSessionSecondsLeft] = useState(null); // null = timer not running; counts down once payment is confirmed
+  const [sessionExpired, setSessionExpired] = useState(false); // true once the session timer has run out — blocks retakes for the rest of this session
+  const stepRef = useRef("start");
+  useEffect(() => {
+    stepRef.current = step;
+  }, [step]);
 
   /* frame templates auto-loaded from src/assets/frames/*.png (see
      FRAME_FOLDER_MODULES) — treated as built-in, not user-editable */
@@ -941,12 +960,46 @@ export default function LumiereBooth() {
     setArmedPhotoIndex(null);
     setActiveSlotIndex(null);
     setRetakeIndex(null);
+    setSessionSecondsLeft(null);
+    setSessionExpired(false);
     setStep("start");
+  }
+
+  /* ================= session countdown timer ================= */
+  /* ticks once per second from the moment payment is confirmed;
+     stops once the session reaches the "done" screen (or is reset) */
+  useEffect(() => {
+    if (sessionSecondsLeft === null || step === "done") return;
+    if (sessionSecondsLeft <= 0) {
+      handleSessionTimeout();
+      return;
+    }
+    const id = setTimeout(() => {
+      setSessionSecondsLeft((s) => (s === null ? null : s - 1));
+    }, 1000);
+    return () => clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionSecondsLeft, step]);
+
+  function handleSessionTimeout() {
+    setSessionSecondsLeft(null);
+    setSessionExpired(true);
+    // nothing captured at all yet — nothing to move forward with, restart
+    if (rawPhotos.length === 0) {
+      fullReset();
+      return;
+    }
+    stopCamera();
+    setRetakeIndex(null);
+    // time's up — no more retakes; move straight to filter selection with
+    // whatever shots were captured so far
+    setStep("filter");
   }
 
   /* ================= capture ================= */
   function doCapture() {
     const video = videoRef.current;
+    if (!video) return;
     const vw = video.videoWidth,
       vh = video.videoHeight;
     if (!vw) return;
@@ -963,17 +1016,16 @@ export default function LumiereBooth() {
     const img = new Image();
     img.onload = () => {
       if (retakeIndex !== null) {
-        // retaking a single photo: replace it in place, then go straight back to review
+        // retaking a single photo: replace it in place, then re-bake and
+        // go straight back to frame selection
         const idx = retakeIndex;
-        setRawPhotos((prev) => {
-          const next = [...prev];
-          next[idx] = { img };
-          return next;
-        });
+        const next = [...rawPhotos];
+        next[idx] = { img };
+        setRawPhotos(next);
         setTimeout(() => {
           stopCamera();
           setRetakeIndex(null);
-          setStep("review");
+          finishCaptureAndGoToFrame(next);
         }, 500);
         return;
       }
@@ -982,7 +1034,7 @@ export default function LumiereBooth() {
         if (next.length >= TOTAL_SHOTS) {
           setTimeout(() => {
             stopCamera();
-            setStep("review");
+            finishCaptureAndGoToFrame(next);
           }, 500);
         }
         return next;
@@ -1002,6 +1054,10 @@ export default function LumiereBooth() {
     setCountdownRunning(true);
     let n = 3;
     const tick = () => {
+      if (stepRef.current !== "capture") {
+        setCountdownRunning(false);
+        return;
+      }
       setCountdownDisplay(n > 0 ? String(n) : "");
       setCountdownKey((k) => k + 1);
       if (n === 0) {
@@ -1017,12 +1073,14 @@ export default function LumiereBooth() {
 
   /* ================= review (Hasil Foto) screen ================= */
   function handleRetakeAll() {
+    if (sessionExpired) return;
     setRetakeIndex(null);
     setRawPhotos([]);
     setStep("capture");
   }
 
   function handleRetakeOne(i) {
+    if (sessionExpired) return;
     setRetakeIndex(i);
     setStep("capture");
   }
@@ -1055,11 +1113,11 @@ export default function LumiereBooth() {
     drawFilteredInto(canvas.getContext("2d"), sample, css, w, h);
   }, [step, rawPhotos, filterId]);
 
-  function bakeFilterAndProceed() {
-    const css = (FILTERS.find((f) => f.id === filterId) || FILTERS[0]).css;
+  function bakePhotosWithFilter(sourcePhotos, filterIdToUse) {
+    const css = (FILTERS.find((f) => f.id === filterIdToUse) || FILTERS[0]).css;
     const wc = getWorkCanvas();
     const wctx = wc.getContext("2d");
-    const promises = rawPhotos.map(
+    const promises = sourcePhotos.map(
       (rp) =>
         new Promise((resolve) => {
           const w = rp.img.width,
@@ -1081,7 +1139,23 @@ export default function LumiereBooth() {
           img.src = url;
         }),
     );
-    Promise.all(promises).then((results) => {
+    return Promise.all(promises);
+  }
+
+  /* once every shot is in, skip review/filter entirely: bake with the
+     "normal" filter and go straight to frame selection */
+  function finishCaptureAndGoToFrame(sourceRawPhotos) {
+    setFilterId("normal");
+    bakePhotosWithFilter(sourceRawPhotos, "normal").then((results) => {
+      setPhotos(results);
+      setSlotStates(rebuildSlotStatesFor(templates, templateId, results));
+      setActiveSlotIndex(null);
+      setStep("frame");
+    });
+  }
+
+  function bakeFilterAndProceed() {
+    bakePhotosWithFilter(rawPhotos, filterId).then((results) => {
       setPhotos(results);
       setSlotStates(rebuildSlotStatesFor(templates, templateId, results));
       setActiveSlotIndex(null);
@@ -1432,6 +1506,7 @@ export default function LumiereBooth() {
 
   function handleSaveAndFinish() {
     handleDownload();
+    setSessionSecondsLeft(null);
     setStep("done");
   }
 
@@ -1646,15 +1721,7 @@ export default function LumiereBooth() {
   ]);
 
   /* ================= derived UI bits ================= */
-  const stepOrder = [
-    "payment",
-    "permission",
-    "capture",
-    "review",
-    "filter",
-    "frame",
-    "preview",
-  ];
+  const stepOrder = ["payment", "permission", "capture", "frame", "preview"];
   const stepIdx = stepOrder.indexOf(step);
   const activeSlotState =
     activeSlotIndex !== null ? slotStates[activeSlotIndex] : null;
@@ -1738,22 +1805,39 @@ export default function LumiereBooth() {
             </span>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            {stepOrder.map((s, i) => (
+          <div className="flex items-center gap-3.5">
+            {sessionSecondsLeft !== null && step !== "done" && (
               <div
-                key={s}
+                className="flex items-center gap-1"
                 style={{
-                  width: i === stepIdx ? 18 : 6,
-                  height: 6,
-                  borderRadius: 3,
-                  background:
-                    stepIdx >= 0 && i <= stepIdx
-                      ? COLORS.gold
-                      : COLORS.panelLine,
-                  transition: "all 200ms ease",
+                  fontFamily: SANS,
+                  fontSize: 12.5,
+                  fontWeight: 600,
+                  letterSpacing: "0.03em",
+                  color: sessionSecondsLeft <= 30 ? "#c94f4f" : COLORS.muted,
                 }}
-              />
-            ))}
+              >
+                <Clock size={13} />
+                {formatSessionTime(sessionSecondsLeft)}
+              </div>
+            )}
+            <div className="flex items-center gap-1.5">
+              {stepOrder.map((s, i) => (
+                <div
+                  key={s}
+                  style={{
+                    width: i === stepIdx ? 18 : 6,
+                    height: 6,
+                    borderRadius: 3,
+                    background:
+                      stepIdx >= 0 && i <= stepIdx
+                        ? COLORS.gold
+                        : COLORS.panelLine,
+                    transition: "all 200ms ease",
+                  }}
+                />
+              ))}
+            </div>
           </div>
         </div>
 
@@ -1892,7 +1976,10 @@ export default function LumiereBooth() {
 
             <div className="mt-auto pt-5.5">
               <button
-                onClick={() => setStep("permission")}
+                onClick={() => {
+                  setSessionSecondsLeft(SESSION_DURATION_SEC);
+                  setStep("permission");
+                }}
                 className="w-full flex items-center justify-center gap-2 py-3 px-5.5 text-[13px] active:opacity-90"
                 style={btnSolid}
               >
@@ -2179,28 +2266,30 @@ export default function LumiereBooth() {
                     alt={`hasil ${i + 1}`}
                     className="w-full h-full object-cover block"
                   />
-                  <button
-                    onClick={() => handleRetakeOne(i)}
-                    className="absolute inset-0 flex flex-col items-center justify-center gap-1 active:opacity-90"
-                    style={{
-                      background: "rgba(16,13,11,0.55)",
-                      border: "none",
-                      color: COLORS.ivory,
-                    }}
-                    aria-label={`Ambil ulang foto ${i + 1}`}
-                  >
-                    <RotateCcw size={17} />
-                    <span
+                  {!sessionExpired && (
+                    <button
+                      onClick={() => handleRetakeOne(i)}
+                      className="absolute inset-0 flex flex-col items-center justify-center gap-1 active:opacity-90"
                       style={{
-                        fontFamily: SANS,
-                        fontSize: 10,
-                        letterSpacing: "0.06em",
-                        textTransform: "uppercase",
+                        background: "rgba(16,13,11,0.55)",
+                        border: "none",
+                        color: COLORS.ivory,
                       }}
+                      aria-label={`Ambil ulang foto ${i + 1}`}
                     >
-                      Ulangi
-                    </span>
-                  </button>
+                      <RotateCcw size={17} />
+                      <span
+                        style={{
+                          fontFamily: SANS,
+                          fontSize: 10,
+                          letterSpacing: "0.06em",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        Ulangi
+                      </span>
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -2208,7 +2297,8 @@ export default function LumiereBooth() {
             <div className="mt-auto pt-6 flex gap-2.5">
               <button
                 onClick={handleRetakeAll}
-                className="flex-1 flex items-center justify-center gap-2 py-3 px-4.5 text-[12.5px] active:opacity-90"
+                disabled={sessionExpired}
+                className="flex-1 flex items-center justify-center gap-2 py-3 px-4.5 text-[12.5px] active:opacity-90 disabled:opacity-30 disabled:pointer-events-none"
                 style={btnGhost}
               >
                 <RotateCcw size={15} />
@@ -2311,7 +2401,7 @@ export default function LumiereBooth() {
         {/* ============ SCREEN 4: FRAME / EDITOR ============ */}
         {step === "frame" && (
           <section className="flex flex-col flex-1 px-5 min-h-0">
-            <StepEyebrow>Langkah 6 dari {stepOrder.length}</StepEyebrow>
+            <StepEyebrow>Langkah 4 dari {stepOrder.length}</StepEyebrow>
             <StepTitle>Pilih Bingkai &amp; Foto</StepTitle>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <div className="lg:w-100 w-50 flex items-center justify-center m-auto">
@@ -2326,7 +2416,7 @@ export default function LumiereBooth() {
                 />
               </div>
               <div>
-                <button
+                {/* <button
                   onClick={openBuilder}
                   className="w-full flex items-center justify-center gap-2 p-3 text-center cursor-pointer"
                   style={{
@@ -2350,7 +2440,7 @@ export default function LumiereBooth() {
                   <span style={{ fontSize: 12.5, letterSpacing: "0.06em" }}>
                     Buat Bingkai Sendiri
                   </span>
-                </button>
+                </button> */}
                 <div className="mt-5 flex flex-col gap-2.5 overflow-y-auto h-80 lg:h-150">
                   {templates.map((T) => {
                     const active = T.id === templateId;
@@ -2586,7 +2676,7 @@ export default function LumiereBooth() {
         {/* ============ SCREEN: PREVIEW AKHIR ============ */}
         {step === "preview" && (
           <section className="flex flex-col flex-1 px-5 pt-6.5 pb-7 min-h-0">
-            <StepEyebrow>Langkah 7 dari {stepOrder.length}</StepEyebrow>
+            <StepEyebrow>Langkah 5 dari {stepOrder.length}</StepEyebrow>
             <StepTitle>Foto + Filter + Bingkai</StepTitle>
             <div className="flex flex-col items-center justify-center">
               <p
