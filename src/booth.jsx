@@ -2187,6 +2187,7 @@ export default function LumiereBooth() {
     setBuilderImageError("");
   }
 
+  // eslint-disable-next-line no-unused-vars
   function openBuilder() {
     resetBuilderForm();
     setBuilderOpen(true);
