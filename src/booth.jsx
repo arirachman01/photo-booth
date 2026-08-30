@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import {
   Camera,
@@ -7,7 +8,12 @@ import {
   AlertCircle,
   QrCode,
   Sparkles,
+  Printer,
+  FlipHorizontal,
 } from "lucide-react";
+import GIF from "gif.js";
+const GIFJS_WORKER_URL = new URL("gif.js/dist/gif.worker.js", import.meta.url)
+  .href;
 
 const COLORS = {
   bg: "#ffffff",
@@ -27,8 +33,20 @@ const SANS = '"Jost", sans-serif';
 
 const TOTAL_SHOTS = 6;
 
-const SESSION_TIME_LIMIT_SEC = 5 * 60;
+/* harga cetak fisik per lembar (dummy) */
+const PRINT_PRICE_PER_COPY = 15000;
+/* batas jumlah lembar yang bisa dipesan dalam satu sesi cetak */
+const PRINT_QTY_MAX = 20;
 
+/* total seconds the guest has, starting right after payment, to finish
+   permission → capture → review. If this runs out while they're still on
+   permission/capture/review, we skip straight to the filter step and
+   drop any retake/re-shoot in progress. If they reach the filter step
+   before it runs out, the timer is simply cleared — normal flow. */
+const SESSION_TIME_LIMIT_SEC = 60;
+
+/* max width/height (px) a frame PNG is downscaled to before use — keeps
+   canvas rendering fast even if someone drops in a huge source file */
 const MAX_FRAME_IMG_DIM = 1600;
 
 /* ================= shared step header atoms ================= */
@@ -251,6 +269,7 @@ const BUILTIN_FRAME_SPECS = [
     cardColor: "#0c0a08",
   },
 ];
+// console.log(BUILTIN_FRAME_SPECS);
 
 /* builtin templates are generated the same way as user-made frames, just
    flagged isCustom:false so they don't show the "SENDIRI" tag / delete icon */
@@ -724,6 +743,59 @@ export default function LumiereBooth() {
   const [cameraStatus, setCameraStatus] = useState("idle"); // idle | requesting | ready | error
   const [cameraErrorMsg, setCameraErrorMsg] = useState("");
   const [retakeIndex, setRetakeIndex] = useState(null); // index of a single photo being retaken, or null for normal capture flow
+  const [previewVariant, setPreviewVariant] = useState("framed"); // "framed" | "liveview" — which version is shown/downloaded on the preview screen
+
+  /* whether captured stills (and the live clip) are flipped to match the
+     mirror/selfie-view the guest sees on screen (true, default — matches
+     the previous fixed behavior) or kept true-to-life / unflipped (false —
+     useful when there's text/logos in the background that need to read
+     correctly) */
+  const [mirrorCapture, setMirrorCapture] = useState(true);
+  const mirrorCaptureRef = useRef(mirrorCapture);
+  useEffect(() => {
+    mirrorCaptureRef.current = mirrorCapture;
+  }, [mirrorCapture]);
+
+  /* ================= cetak fisik (print) ================= */
+  const [printQty, setPrintQty] = useState(1);
+  const [printImageUrl, setPrintImageUrl] = useState(null);
+
+  /* "live view" clips: a short recorded video (not a still) spanning the
+     countdown + shutter, captured alongside EACH still photo. Indexed the
+     same way as rawPhotos/photos (index i's clip belongs to photo i), so
+     every shot gets its own live view instead of just one for the whole
+     session. */
+  const [liveClipUrls, setLiveClipUrls] = useState([]);
+  const [liveClipMimes, setLiveClipMimes] = useState([]);
+  const [liveClipSupported, setLiveClipSupported] = useState(
+    typeof window !== "undefined" && !!window.MediaRecorder,
+  );
+  const mediaRecorderRef = useRef(null);
+  const liveClipChunksRef = useRef([]);
+
+  /* which photo's live view is currently shown/downloaded on the preview
+     screen (and, while shooting, which slot a new recording belongs to) */
+  const [previewLiveIndex, setPreviewLiveIndex] = useState(0);
+
+  /* each video clip above also gets converted into a real animated GIF —
+     GIFs loop forever wherever they're opened (chat apps, galleries,
+     browsers) with no play button and no "hit play" step, unlike a video
+     file. Conversion happens in the background right after recording
+     stops, per photo; the video is kept as an automatic fallback if it
+     fails. */
+  const [liveClipGifUrls, setLiveClipGifUrls] = useState([]);
+  const [gifGeneratingByIndex, setGifGeneratingByIndex] = useState({});
+  const gifGenTokensRef = useRef({}); // idx -> token, invalidates stale in-flight generations
+
+  /* "bingkai + live" preview: the SAME frame/template layout as the normal
+     framed photo, but every slot plays its own live clip instead of the
+     still — composited into one single looping animated GIF so the frame
+     graphics (background + foreground art) and every slot's live view all
+     move together. */
+  const [framedLiveGifUrl, setFramedLiveGifUrl] = useState(null);
+  const [framedLiveGifGenerating, setFramedLiveGifGenerating] = useState(false);
+  const framedLiveGifTokenRef = useRef(0); // invalidates stale in-flight generations
+  const framedLiveGifSignatureRef = useRef(null); // last template/slots/clips combo it was (re)built for — avoids redundant regeneration
 
   /* ================= post-payment session countdown ================= */
   const [sessionSecondsLeft, setSessionSecondsLeft] = useState(
@@ -929,7 +1001,6 @@ export default function LumiereBooth() {
 
   useEffect(() => {
     if (step !== "capture") return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     startCamera();
     return () => {
       stopCamera();
@@ -976,8 +1047,8 @@ export default function LumiereBooth() {
     if (!["permission", "capture", "review"].includes(step)) return;
     sessionExpiredRef.current = true;
     clearSessionTimer();
+    stopLiveClipRecording();
     stopCamera();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCountdownRunning(false);
     setCountdownDisplay("");
     setRetakeIndex(null);
@@ -995,6 +1066,7 @@ export default function LumiereBooth() {
   function fullReset() {
     clearSessionTimer();
     setSessionSecondsLeft(SESSION_TIME_LIMIT_SEC);
+    discardAllLiveClips();
     stopCamera();
     setRawPhotos([]);
     setPhotos([]);
@@ -1004,8 +1076,455 @@ export default function LumiereBooth() {
     setArmedPhotoIndex(null);
     setActiveSlotIndex(null);
     setRetakeIndex(null);
+    setPreviewVariant("framed");
+    setPreviewLiveIndex(0);
+    setMirrorCapture(true);
+    setPrintQty(1);
+    setPrintImageUrl(null);
     setStep("start");
   }
+
+  /* ================= live view clip recording ================= */
+  /* turn the just-recorded video clip into a real, endlessly-looping
+     animated GIF by sampling frames out of it on an offscreen <video>
+     and feeding them to gif.js (imported from the npm package above).
+     Runs in the background; if anything here fails, the video clip is
+     simply used as-is (see UI below). */
+  async function generateLiveClipGif(videoBlobUrl, idx) {
+    const myToken = (gifGenTokensRef.current[idx] || 0) + 1;
+    gifGenTokensRef.current[idx] = myToken;
+    setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: true }));
+    try {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.src = videoBlobUrl;
+      await new Promise((resolve, reject) => {
+        video.onloadedmetadata = () => resolve();
+        video.onerror = () => reject(new Error("Video tidak dapat dimuat"));
+      });
+
+      const duration =
+        video.duration && isFinite(video.duration) ? video.duration : 2.5;
+      const FRAME_COUNT = 14;
+      const MAX_W = 480;
+      const scale = Math.min(1, MAX_W / (video.videoWidth || MAX_W));
+      const w = Math.round((video.videoWidth || MAX_W) * scale);
+      const h = Math.round((video.videoHeight || MAX_W) * scale);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+
+      const gif = new GIF({
+        workers: 2,
+        quality: 10,
+        width: w,
+        height: h,
+        workerScript: GIFJS_WORKER_URL,
+      });
+
+      const frameDelayMs = Math.max(
+        60,
+        Math.round((duration * 1000) / FRAME_COUNT),
+      );
+
+      for (let i = 0; i < FRAME_COUNT; i++) {
+        if (gifGenTokensRef.current[idx] !== myToken) return; // superseded by a newer clip for this photo
+        const t = Math.min(duration - 0.02, (i / FRAME_COUNT) * duration);
+        await new Promise((resolve) => {
+          const onSeeked = () => {
+            video.removeEventListener("seeked", onSeeked);
+            resolve();
+          };
+          video.addEventListener("seeked", onSeeked);
+          video.currentTime = t;
+        });
+        // mirror the frame so it matches the selfie-view still photo,
+        // following the same mirror/no-mirror choice used for the stills
+        ctx.save();
+        if (mirrorCaptureRef.current) {
+          ctx.translate(w, 0);
+          ctx.scale(-1, 1);
+        }
+        ctx.drawImage(video, 0, 0, w, h);
+        ctx.restore();
+        gif.addFrame(ctx, { copy: true, delay: frameDelayMs });
+      }
+
+      if (gifGenTokensRef.current[idx] !== myToken) return;
+
+      await new Promise((resolve, reject) => {
+        gif.on("finished", (blob) => {
+          if (gifGenTokensRef.current[idx] === myToken) {
+            const url = URL.createObjectURL(blob);
+            setLiveClipGifUrls((prev) => {
+              const next = [...prev];
+              if (next[idx]) URL.revokeObjectURL(next[idx]);
+              next[idx] = url;
+              return next;
+            });
+          }
+          resolve();
+        });
+        gif.on("abort", () => reject(new Error("GIF dibatalkan")));
+        gif.render();
+      });
+    } catch (e) {
+      console.log(e);
+      // no GIF — the recorded video clip (with loop/autoplay) is still fine
+    } finally {
+      if (gifGenTokensRef.current[idx] === myToken)
+        setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
+    }
+  }
+
+  /* builds the "Bingkai + Live" GIF: the exact same template layout used by
+     the normal framed photo (same background art, same slot positions/
+     shapes, same foreground art, same zoom/offset per slot) — except each
+     slot samples frames from that photo's own recorded live clip instead of
+     the static still. Slots with no recorded clip fall back to the still so
+     the frame never shows a blank hole. One combined GIF for the whole
+     composition, so everything loops together in sync. */
+  async function generateFramedLiveGif() {
+    const myToken = framedLiveGifTokenRef.current + 1;
+    framedLiveGifTokenRef.current = myToken;
+    setFramedLiveGifGenerating(true);
+    try {
+      const T = currentTemplate();
+      const allSlots = T.mirrorSlots ? [...T.slots, ...T.mirrorSlots] : T.slots;
+
+      // one offscreen <video> per slot that has a matching live clip
+      const slotVideos = await Promise.all(
+        allSlots.map(async (slot, i) => {
+          const ss = slotStates[i % T.slots.length];
+          const clipUrl =
+            ss && ss.photoIndex !== null ? liveClipUrls[ss.photoIndex] : null;
+          if (!clipUrl) return null;
+          const video = document.createElement("video");
+          video.muted = true;
+          video.playsInline = true;
+          video.src = clipUrl;
+          try {
+            await new Promise((resolve, reject) => {
+              video.onloadedmetadata = () => resolve();
+              video.onerror = () =>
+                reject(new Error("Video tidak dapat dimuat"));
+            });
+          } catch (e) {
+            console.log(e);
+            return null;
+          }
+          return video;
+        }),
+      );
+
+      if (framedLiveGifTokenRef.current !== myToken) return;
+      if (slotVideos.every((v) => !v)) return; // nothing to animate
+
+      const durations = slotVideos
+        .filter(Boolean)
+        .map((v) => (v.duration && isFinite(v.duration) ? v.duration : 2.5));
+      const duration = durations.length ? Math.max(...durations) : 2.5;
+      const FRAME_COUNT = 14;
+      const w = Math.round(T.width * RES);
+      const h = Math.round(T.height * RES);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+
+      const gif = new GIF({
+        workers: 2,
+        quality: 10,
+        width: w,
+        height: h,
+        workerScript: GIFJS_WORKER_URL,
+      });
+
+      const frameDelayMs = Math.max(
+        60,
+        Math.round((duration * 1000) / FRAME_COUNT),
+      );
+
+      function paintFramedLiveSlot(slot, ss, video) {
+        ctx.save();
+        clipSlot(ctx, slot);
+        if (video) {
+          const vw = video.videoWidth || slot.w;
+          const vh = video.videoHeight || slot.h;
+          const baseScale = Math.max(slot.w / vw, slot.h / vh);
+          const zoom = ss ? ss.zoom : 1;
+          const scale = baseScale * zoom;
+          const dw = vw * scale,
+            dh = vh * scale;
+          const cx = slot.x + slot.w / 2 + (ss ? ss.offsetX : 0);
+          const cy = slot.y + slot.h / 2 + (ss ? ss.offsetY : 0);
+          // mirror to match the selfie-view still, same as the recorded
+          // stills and the single-clip GIF above — flip in place around
+          // this slot's own center so only this slot's image flips
+          if (mirrorCaptureRef.current) {
+            ctx.translate(cx, 0);
+            ctx.scale(-1, 1);
+            ctx.translate(-cx, 0);
+          }
+          ctx.drawImage(video, cx - dw / 2, cy - dh / 2, dw, dh);
+        } else if (ss && ss.photoIndex !== null && photos[ss.photoIndex]) {
+          const img = photos[ss.photoIndex].img;
+          const baseScale = Math.max(slot.w / img.width, slot.h / img.height);
+          const scale = baseScale * ss.zoom;
+          const dw = img.width * scale,
+            dh = img.height * scale;
+          const cx = slot.x + slot.w / 2 + ss.offsetX;
+          const cy = slot.y + slot.h / 2 + ss.offsetY;
+          ctx.drawImage(img, cx - dw / 2, cy - dh / 2, dw, dh);
+        }
+        ctx.restore();
+      }
+
+      for (let f = 0; f < FRAME_COUNT; f++) {
+        if (framedLiveGifTokenRef.current !== myToken) return;
+        const t = Math.min(duration - 0.02, (f / FRAME_COUNT) * duration);
+        await Promise.all(
+          slotVideos.map((video) => {
+            if (!video) return Promise.resolve();
+            const vDur =
+              video.duration && isFinite(video.duration)
+                ? video.duration
+                : duration;
+            const vt = Math.min(vDur - 0.02, t % vDur);
+            return new Promise((resolve) => {
+              const onSeeked = () => {
+                video.removeEventListener("seeked", onSeeked);
+                resolve();
+              };
+              video.addEventListener("seeked", onSeeked);
+              video.currentTime = Math.max(0, vt);
+            });
+          }),
+        );
+
+        if (framedLiveGifTokenRef.current !== myToken) return;
+
+        ctx.save();
+        ctx.clearRect(0, 0, w, h);
+        ctx.scale(RES, RES);
+        T.drawBg(ctx, T);
+        T.slots.forEach((slot, i) => {
+          paintFramedLiveSlot(slot, slotStates[i], slotVideos[i]);
+        });
+        if (T.mirrorSlots) {
+          T.mirrorSlots.forEach((slot, i) => {
+            paintFramedLiveSlot(
+              slot,
+              slotStates[i],
+              slotVideos[T.slots.length + i],
+            );
+          });
+        }
+        T.drawFg(ctx, T);
+        ctx.restore();
+
+        gif.addFrame(ctx, { copy: true, delay: frameDelayMs });
+      }
+
+      if (framedLiveGifTokenRef.current !== myToken) return;
+
+      await new Promise((resolve, reject) => {
+        gif.on("finished", (blob) => {
+          if (framedLiveGifTokenRef.current === myToken) {
+            const url = URL.createObjectURL(blob);
+            setFramedLiveGifUrl((prev) => {
+              if (prev) URL.revokeObjectURL(prev);
+              return url;
+            });
+          }
+          resolve();
+        });
+        gif.on("abort", () => reject(new Error("GIF dibatalkan")));
+        gif.render();
+      });
+    } catch (e) {
+      console.log(e);
+    } finally {
+      if (framedLiveGifTokenRef.current === myToken)
+        setFramedLiveGifGenerating(false);
+    }
+  }
+
+  /* whether the current template has at least one slot whose assigned
+     photo has a recorded live clip — used to enable the "Bingkai + Live"
+     tab and to decide whether it's worth (re)generating that GIF */
+  function hasFramedLiveClip() {
+    return slotStates.some(
+      (ss) => ss && ss.photoIndex !== null && liveClipUrls[ss.photoIndex],
+    );
+  }
+
+  /* fingerprint of everything the "Bingkai + Live" GIF depends on, so we
+     can tell whether an already-built (or in-flight) GIF is still valid
+     for the current template/slot/clip combo */
+  function framedLiveSignature() {
+    return JSON.stringify([
+      templateId,
+      slotStates.map(
+        (ss) => ss && [ss.photoIndex, ss.zoom, ss.offsetX, ss.offsetY],
+      ),
+      liveClipUrls,
+    ]);
+  }
+
+  /* (re)builds the "Bingkai + Live" GIF only if it hasn't already been
+     built (or isn't already being built) for the current combo — used both
+     by the pre-preview loading screen and by the tab switch, so switching
+     to a tab that's already ready doesn't trigger pointless extra work */
+  function maybeGenerateFramedLiveGif() {
+    if (!hasFramedLiveClip()) return Promise.resolve();
+    const sig = framedLiveSignature();
+    if (
+      sig === framedLiveGifSignatureRef.current &&
+      (framedLiveGifUrl || framedLiveGifGenerating)
+    ) {
+      return Promise.resolve();
+    }
+    framedLiveGifSignatureRef.current = sig;
+    return generateFramedLiveGif();
+  }
+
+  function pickRecorderMimeType() {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
+    const candidates = [
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
+      "video/mp4",
+    ];
+    for (const c of candidates) {
+      if (MediaRecorder.isTypeSupported(c)) return c;
+    }
+    return "";
+  }
+
+  function startLiveClipRecording(idx) {
+    const stream = streamRef.current;
+    if (!stream || !window.MediaRecorder) {
+      setLiveClipSupported(false);
+      return;
+    }
+    try {
+      const mime = pickRecorderMimeType();
+      liveClipChunksRef.current = [];
+      const rec = new MediaRecorder(
+        stream,
+        mime ? { mimeType: mime } : undefined,
+      );
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) liveClipChunksRef.current.push(e.data);
+      };
+      rec.onstop = () => {
+        if (liveClipChunksRef.current.length === 0) return;
+        const type = mime || "video/webm";
+        const blob = new Blob(liveClipChunksRef.current, { type });
+        const url = URL.createObjectURL(blob);
+        setLiveClipUrls((prev) => {
+          const next = [...prev];
+          if (next[idx]) URL.revokeObjectURL(next[idx]);
+          next[idx] = url;
+          return next;
+        });
+        setLiveClipMimes((prev) => {
+          const next = [...prev];
+          next[idx] = type;
+          return next;
+        });
+        generateLiveClipGif(url, idx);
+      };
+      rec.start();
+      mediaRecorderRef.current = rec;
+      setLiveClipSupported(true);
+    } catch (e) {
+      console.log(e);
+      setLiveClipSupported(false);
+    }
+  }
+
+  function stopLiveClipRecording() {
+    const rec = mediaRecorderRef.current;
+    mediaRecorderRef.current = null;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch (e) {
+        console.log(e);
+      }
+    }
+  }
+
+  /* clears just one photo's slot (used right before a fresh/retake
+     recording starts for that index) */
+  function resetLiveClipSlot(idx) {
+    gifGenTokensRef.current[idx] = (gifGenTokensRef.current[idx] || 0) + 1; // invalidate in-flight GIF gen for this slot
+    stopLiveClipRecording();
+    setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
+    setLiveClipUrls((prev) => {
+      if (!prev[idx]) return prev;
+      const next = [...prev];
+      URL.revokeObjectURL(next[idx]);
+      next[idx] = null;
+      return next;
+    });
+    setLiveClipGifUrls((prev) => {
+      if (!prev[idx]) return prev;
+      const next = [...prev];
+      URL.revokeObjectURL(next[idx]);
+      next[idx] = null;
+      return next;
+    });
+  }
+
+  /* clears every photo's live view (full retake / full reset) */
+  function discardAllLiveClips() {
+    gifGenTokensRef.current = {};
+    framedLiveGifTokenRef.current += 1; // invalidate any in-flight framed-live generation
+    stopLiveClipRecording();
+    setGifGeneratingByIndex({});
+    setLiveClipUrls((prev) => {
+      prev.forEach((u) => u && URL.revokeObjectURL(u));
+      return [];
+    });
+    setLiveClipGifUrls((prev) => {
+      prev.forEach((u) => u && URL.revokeObjectURL(u));
+      return [];
+    });
+    setLiveClipMimes([]);
+    setFramedLiveGifGenerating(false);
+    setFramedLiveGifUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+  }
+
+  useEffect(() => {
+    return () => {
+      gifGenTokensRef.current = {};
+      framedLiveGifTokenRef.current += 1;
+      stopLiveClipRecording();
+      setLiveClipUrls((prev) => {
+        prev.forEach((u) => u && URL.revokeObjectURL(u));
+        return prev;
+      });
+      setLiveClipGifUrls((prev) => {
+        prev.forEach((u) => u && URL.revokeObjectURL(u));
+        return prev;
+      });
+      setFramedLiveGifUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return prev;
+      });
+    };
+  }, []);
 
   /* ================= capture ================= */
   function doCapture() {
@@ -1018,8 +1537,10 @@ export default function LumiereBooth() {
     wc.height = vh;
     const wctx = wc.getContext("2d");
     wctx.save();
-    wctx.translate(vw, 0);
-    wctx.scale(-1, 1);
+    if (mirrorCaptureRef.current) {
+      wctx.translate(vw, 0);
+      wctx.scale(-1, 1);
+    }
     wctx.drawImage(video, 0, 0, vw, vh);
     wctx.restore();
     const url = wc.toDataURL("image/jpeg", 0.92);
@@ -1034,6 +1555,7 @@ export default function LumiereBooth() {
           return next;
         });
         setTimeout(() => {
+          stopLiveClipRecording();
           stopCamera();
           setRetakeIndex(null);
           setStep("review");
@@ -1044,6 +1566,7 @@ export default function LumiereBooth() {
         const next = [...prev, { img }];
         if (next.length >= TOTAL_SHOTS) {
           setTimeout(() => {
+            stopLiveClipRecording();
             stopCamera();
             setStep("review");
           }, 500);
@@ -1062,6 +1585,9 @@ export default function LumiereBooth() {
       (retakeIndex === null && rawPhotos.length >= TOTAL_SHOTS)
     )
       return;
+    const shotIndex = retakeIndex !== null ? retakeIndex : rawPhotos.length;
+    resetLiveClipSlot(shotIndex);
+    startLiveClipRecording(shotIndex);
     setCountdownRunning(true);
     let n = 3;
     const tick = () => {
@@ -1082,6 +1608,7 @@ export default function LumiereBooth() {
   function handleRetakeAll() {
     setRetakeIndex(null);
     setRawPhotos([]);
+    discardAllLiveClips();
     setStep("capture");
   }
 
@@ -1247,6 +1774,15 @@ export default function LumiereBooth() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [assetTick]);
 
+  /* default the live-view selector to the first photo that actually has a
+     recorded clip whenever the guest lands on the preview screen */
+  useEffect(() => {
+    if (step !== "preview") return;
+    const firstWithClip = liveClipUrls.findIndex((u) => !!u);
+    setPreviewLiveIndex(firstWithClip >= 0 ? firstWithClip : 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
   /* size + render the read-only final preview canvas */
   useEffect(() => {
     if (step !== "preview") return;
@@ -1259,6 +1795,34 @@ export default function LumiereBooth() {
     drawPreview();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, templateId, photos, slotStates]);
+
+  /* (re)generate the combined "Bingkai + Live" GIF whenever the guest is
+     looking at that tab and the underlying frame/slots/clips it depends on
+     change — same trigger pattern as the per-photo GIF above, just for the
+     whole composited frame instead of a single slot. Skips work entirely
+     if it's already built (or building) for the current combo, e.g. right
+     after the pre-preview loading screen below already built it. */
+  useEffect(() => {
+    if (step !== "preview" || previewVariant !== "framed-live") return;
+    maybeGenerateFramedLiveGif();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, previewVariant, templateId, slotStates, liveClipUrls]);
+
+  /* transitional loading screen shown right after "Lanjut ke Preview":
+     builds the "Bingkai + Live" GIF up front (so it's instantly ready the
+     moment the guest taps that tab) before actually revealing the final
+     preview screen. Skipped entirely if there's nothing to build. */
+  useEffect(() => {
+    if (step !== "preparingPreview") return;
+    let cancelled = false;
+    maybeGenerateFramedLiveGif().finally(() => {
+      if (!cancelled) setStep("preview");
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
 
   /* redraw when slot states / active slot / photos change */
   useEffect(() => {
@@ -1481,21 +2045,132 @@ export default function LumiereBooth() {
     setArmedPhotoIndex((prev) => (prev === idx ? null : idx));
   }
 
-  function handleDownload() {
+  /* renders the final composited (framed) photo to an offscreen canvas —
+     shared by the PNG download and the print flow so they stay in sync */
+  function renderFinalOffscreenCanvas() {
     const T = currentTemplate();
     const off = document.createElement("canvas");
     off.width = T.width * RES;
     off.height = T.height * RES;
     drawComposition(off, true);
+    return off;
+  }
+
+  function handleDownload() {
+    const T = currentTemplate();
+    const off = renderFinalOffscreenCanvas();
     const link = document.createElement("a");
     link.download = `Astâr-booth-${T.id}.png`;
     link.href = off.toDataURL("image/png");
     link.click();
   }
 
+  /* "normal photos" export: every single shot exactly as filtered/mirrored
+     when it was taken — no frame, no live view, just the plain still —
+     one file per shot. Staggered like the live-view "download all" so the
+     browser doesn't treat the burst of downloads as a popup flood. */
+  function handleDownloadAllPhotos() {
+    let delay = 0;
+    photos.forEach((p, i) => {
+      if (!p || !p.url) return;
+      const runDelay = delay;
+      setTimeout(() => {
+        const link = document.createElement("a");
+        link.download = `Astâr-booth-foto-${i + 1}.jpg`;
+        link.href = p.url;
+        link.click();
+      }, runDelay);
+      delay += 400;
+    });
+  }
+
+  /* "live view" export: the filtered photo(s) exactly as captured by the
+     camera, with no frame/template composited on top */
+  /* "live view" export: the short recorded clip spanning the countdown +
+     shutter — an actual moving video, not a still frame */
+  /* "live view" export: prefer the real animated GIF (loops forever
+     anywhere it's opened — chat apps, galleries, browsers — with no play
+     button needed); fall back to the recorded video clip if the GIF
+     hasn't finished generating or failed to generate. Downloads EVERY
+     photo's live view (not just the one currently shown on screen), one
+     file per shot, staggered slightly so the browser doesn't treat the
+     burst of downloads as a popup flood and block them. */
+  function handleDownloadLiveView() {
+    const total = Math.max(liveClipUrls.length, liveClipGifUrls.length);
+    let delay = 0;
+    for (let i = 0; i < total; i++) {
+      const gifUrl = liveClipGifUrls[i];
+      const clipUrl = liveClipUrls[i];
+      if (!gifUrl && !clipUrl) continue;
+      const runDelay = delay;
+      setTimeout(() => {
+        const link = document.createElement("a");
+        if (gifUrl) {
+          link.download = `Astâr-booth-liveview-${i + 1}.gif`;
+          link.href = gifUrl;
+        } else {
+          const mime = liveClipMimes[i] || "video/webm";
+          const ext = mime.includes("mp4") ? "mp4" : "webm";
+          link.download = `Astâr-booth-liveview-${i + 1}.${ext}`;
+          link.href = clipUrl;
+        }
+        link.click();
+      }, runDelay);
+      delay += 400;
+    }
+  }
+
+  /* how many shots actually have a usable live-view clip (video and/or
+     GIF) — used to label/enable the "download all" button */
+  function liveClipsAvailableCount() {
+    const total = Math.max(liveClipUrls.length, liveClipGifUrls.length);
+    let n = 0;
+    for (let i = 0; i < total; i++) {
+      if (liveClipUrls[i] || liveClipGifUrls[i]) n++;
+    }
+    return n;
+  }
+
+  /* downloads the combined "Bingkai + Live" GIF; if it hasn't finished
+     generating yet, falls back to the static framed PNG so "Simpan" always
+     produces something rather than doing nothing */
+  function handleDownloadFramedLive() {
+    if (framedLiveGifUrl) {
+      const T = currentTemplate();
+      const link = document.createElement("a");
+      link.download = `Astâr-booth-bingkai-live-${T.id}.gif`;
+      link.href = framedLiveGifUrl;
+      link.click();
+    } else {
+      handleDownload();
+    }
+  }
+
+  /* "Simpan" only moves the guest to the SELESAI screen — it no longer
+     downloads anything by itself. Every download (framed, framed+live,
+     all photos, all live views) only happens when the guest explicitly
+     taps one of the download buttons on that screen. */
   function handleSaveAndFinish() {
-    handleDownload();
     setStep("done");
+  }
+
+  /* ================= cetak fisik (print) ================= */
+  /* re-renders the framed photo as an image so it can be previewed and
+     repeated in the hidden print area, then opens the quantity screen */
+  function openPrintFlow() {
+    const off = renderFinalOffscreenCanvas();
+    setPrintImageUrl(off.toDataURL("image/png"));
+    setPrintQty(1);
+    setStep("printQty");
+  }
+
+  /* actually sends the job to the printer via the browser's print dialog.
+     The hidden #lb-print-area below is repeated once per copy requested,
+     so the OS print dialog produces exactly `printQty` pages/prints in a
+     single job. */
+  function handlePrint() {
+    window.print();
+    setStep("printDone");
   }
 
   /* ================= custom frame builder ================= */
@@ -1512,7 +2187,6 @@ export default function LumiereBooth() {
     setBuilderImageError("");
   }
 
-  // eslint-disable-next-line no-unused-vars
   function openBuilder() {
     resetBuilderForm();
     setBuilderOpen(true);
@@ -1776,6 +2450,15 @@ export default function LumiereBooth() {
         .lb-flash-pop{animation:lbFlashPop .35s ease;}
         .lb-cd-pop{animation:lbCdPop .9s ease;}
         input[type="range"].lb-range{accent-color:${COLORS.gold};}
+        #lb-print-area{display:none;}
+        @media print{
+          body *{visibility:hidden;}
+          #lb-print-area, #lb-print-area *{visibility:visible;}
+          #lb-print-area{display:block;position:absolute;top:0;left:0;width:100%;margin:0;padding:0;}
+          .lb-print-page{width:100%;display:flex;align-items:center;justify-content:center;page-break-after:always;break-after:page;}
+          .lb-print-page:last-child{page-break-after:auto;break-after:auto;}
+          .lb-print-page img{max-width:100%;max-height:100vh;display:block;}
+        }
       `}</style>
 
       <div
@@ -1841,23 +2524,25 @@ export default function LumiereBooth() {
                 </span>
               </div>
             )}
-            <div className="flex items-center gap-1.5">
-              {stepOrder.map((s, i) => (
-                <div
-                  key={s}
-                  style={{
-                    width: i === stepIdx ? 18 : 6,
-                    height: 6,
-                    borderRadius: 3,
-                    background:
-                      stepIdx >= 0 && i <= stepIdx
-                        ? COLORS.gold
-                        : COLORS.panelLine,
-                    transition: "all 200ms ease",
-                  }}
-                />
-              ))}
-            </div>
+            {stepIdx >= 0 && (
+              <div className="flex items-center gap-1.5">
+                {stepOrder.map((s, i) => (
+                  <div
+                    key={s}
+                    style={{
+                      width: i === stepIdx ? 18 : 6,
+                      height: 6,
+                      borderRadius: 3,
+                      background:
+                        stepIdx >= 0 && i <= stepIdx
+                          ? COLORS.gold
+                          : COLORS.panelLine,
+                      transition: "all 200ms ease",
+                    }}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -2111,8 +2796,74 @@ export default function LumiereBooth() {
               )}
             </div>
 
+            {/* toggle: cermin (mirrored, seperti yang terlihat di layar)
+                vs asli (tidak dibalik) — mengunci begitu foto pertama
+                diambil supaya keenam foto dalam satu sesi konsisten */}
+            <div className="flex flex-col items-center mt-4.5">
+              <div
+                className="flex items-center justify-center gap-1 mx-auto"
+                style={{
+                  background: COLORS.bgSoft,
+                  border: `1px solid ${COLORS.panelLine}`,
+                  borderRadius: 999,
+                  padding: 3,
+                }}
+              >
+                {[
+                  { id: true, label: "Cermin" },
+                  { id: false, label: "Asli" },
+                ].map((opt) => {
+                  const active = mirrorCapture === opt.id;
+                  const locked = rawPhotos.length > 0 || countdownRunning;
+                  return (
+                    <button
+                      key={String(opt.id)}
+                      onClick={() => !locked && setMirrorCapture(opt.id)}
+                      disabled={locked}
+                      title={
+                        locked
+                          ? "Mode kamera terkunci setelah foto pertama diambil"
+                          : undefined
+                      }
+                      className="flex items-center gap-1.5 py-1.5 px-4"
+                      style={{
+                        background: active ? COLORS.gold : "transparent",
+                        color: locked
+                          ? COLORS.panelLine
+                          : active
+                            ? COLORS.ink
+                            : COLORS.muted,
+                        border: "none",
+                        borderRadius: 999,
+                        fontFamily: SANS,
+                        fontSize: 11.5,
+                        letterSpacing: "0.04em",
+                        cursor: locked ? "not-allowed" : "pointer",
+                        opacity: locked ? 0.6 : 1,
+                      }}
+                    >
+                      <FlipHorizontal size={12} />
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p
+                className="text-center mt-1.5"
+                style={{
+                  fontSize: 10.5,
+                  color: COLORS.muted,
+                  maxWidth: "30ch",
+                }}
+              >
+                {mirrorCapture
+                  ? "Hasil foto terbalik seperti cermin, sesuai tampilan di layar."
+                  : "Hasil foto tidak dibalik — sesuai arah sebenarnya."}
+              </p>
+            </div>
+
             <div
-              className="relative lg:w-150 shrink-0 aspect-3/4 md:aspect-16/10 mx-auto rounded-md"
+              className="relative lg:w-150 shrink-0 aspect-3/4 md:aspect-16/10 mx-auto rounded-md mt-4.5"
               style={{
                 background: "#000",
                 overflow: "hidden",
@@ -2125,7 +2876,7 @@ export default function LumiereBooth() {
                 playsInline
                 muted
                 className="w-full h-full object-cover block"
-                style={{ transform: "scaleX(-1)" }}
+                style={{ transform: mirrorCapture ? "scaleX(-1)" : "none" }}
               />
               <div
                 key={flashKey}
@@ -2232,6 +2983,7 @@ export default function LumiereBooth() {
                 <button
                   onClick={() => {
                     setRetakeIndex(null);
+                    stopLiveClipRecording();
                     stopCamera();
                     setStep("review");
                   }}
@@ -2350,47 +3102,56 @@ export default function LumiereBooth() {
               >
                 Filter akan diterapkan ke seluruh foto yang Anda ambil.
               </p>
+            </div>
 
+            <div
+              className="w-full mt-4.5 shrink-0"
+              style={{
+                background: COLORS.bgSoft,
+                border: `1px solid ${COLORS.panelLine}`,
+                overflow: "hidden",
+              }}
+            >
               <canvas
                 ref={filterPreviewCanvasRef}
-                className="lg:w-150 h-auto block"
+                className="w-full h-auto block"
               />
+            </div>
 
-              <div className="flex gap-3 overflow-x-auto pt-4.5 px-0.5 pb-1.5 lb-scrollbar-none">
-                {FILTERS.map((f) => {
-                  const active = f.id === filterId;
-                  return (
-                    <button
-                      key={f.id}
-                      onClick={() => setFilterId(f.id)}
-                      className="shrink-0 w-17.5 text-center"
-                      style={{ background: "none", border: "none", padding: 0 }}
+            <div className="flex gap-3 overflow-x-auto pt-4.5 px-0.5 pb-1.5 lb-scrollbar-none">
+              {FILTERS.map((f) => {
+                const active = f.id === filterId;
+                return (
+                  <button
+                    key={f.id}
+                    onClick={() => setFilterId(f.id)}
+                    className="shrink-0 w-17.5 text-center"
+                    style={{ background: "none", border: "none", padding: 0 }}
+                  >
+                    <canvas
+                      ref={(el) => {
+                        filterChipRefs.current[f.id] = el;
+                      }}
+                      width={140}
+                      height={140}
+                      className="w-17.5 h-17.5 object-cover block"
+                      style={{
+                        border: `2px solid ${active ? COLORS.gold : COLORS.panelLine}`,
+                      }}
+                    />
+                    <div
+                      className="mt-1.5 leading-tight"
+                      style={{
+                        fontSize: 10.5,
+                        letterSpacing: "0.02em",
+                        color: active ? COLORS.goldSoft : COLORS.muted,
+                      }}
                     >
-                      <canvas
-                        ref={(el) => {
-                          filterChipRefs.current[f.id] = el;
-                        }}
-                        width={140}
-                        height={140}
-                        className="w-17.5 h-17.5 object-cover block"
-                        style={{
-                          border: `2px solid ${active ? COLORS.gold : COLORS.panelLine}`,
-                        }}
-                      />
-                      <div
-                        className="mt-1.5 leading-tight"
-                        style={{
-                          fontSize: 10.5,
-                          letterSpacing: "0.02em",
-                          color: active ? COLORS.goldSoft : COLORS.muted,
-                        }}
-                      >
-                        {f.name}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
+                      {f.name}
+                    </div>
+                  </button>
+                );
+              })}
             </div>
 
             <div className="mt-auto pt-4">
@@ -2670,7 +3431,9 @@ export default function LumiereBooth() {
             </div>
             <div className="mt-5">
               <button
-                onClick={() => setStep("preview")}
+                onClick={() =>
+                  setStep(hasFramedLiveClip() ? "preparingPreview" : "preview")
+                }
                 className="w-full flex items-center justify-center gap-2 py-3 px-5.5 text-[13px] active:opacity-90"
                 style={btnSolid}
               >
@@ -2678,6 +3441,40 @@ export default function LumiereBooth() {
                 <ArrowRight size={16} />
               </button>
             </div>
+          </section>
+        )}
+
+        {/* ============ SCREEN: MENYIAPKAN BINGKAI + LIVE ============
+            transitional loading screen between "frame" and the final
+            preview — keeps the guest here until the combined Bingkai +
+            Live GIF has finished building, instead of showing it half
+            ready on the preview screen. */}
+        {step === "preparingPreview" && (
+          <section className="flex flex-col flex-1 items-center justify-center px-5 pt-6.5 pb-7 min-h-0">
+            <div
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: "50%",
+                border: `3px solid ${COLORS.panelLine}`,
+                borderTopColor: COLORS.gold,
+                animation: "lb-spin 0.8s linear infinite",
+              }}
+            />
+            <style>{`@keyframes lb-spin { to { transform: rotate(360deg); } }`}</style>
+            <StepTitle>Menyusun Bingkai + Live View</StepTitle>
+            <p
+              className="text-center mx-auto mt-2.5"
+              style={{
+                fontSize: 13.5,
+                lineHeight: 1.65,
+                color: COLORS.muted,
+                maxWidth: 280,
+              }}
+            >
+              Mohon tunggu sebentar, sedang menggabungkan bingkai dengan live
+              view setiap foto…
+            </p>
           </section>
         )}
 
@@ -2700,8 +3497,94 @@ export default function LumiereBooth() {
               </p>
             </div>
 
+            {/* toggle: bingkai (framed, composited) vs live view (filtered
+                photo as taken, no frame) — determines what's shown below
+                and which version gets downloaded when "Simpan" is pressed */}
             <div
-              className="mt-5 p-3.5"
+              className="flex items-center justify-center gap-1 mt-4.5 mx-auto"
+              style={{
+                background: COLORS.bgSoft,
+                border: `1px solid ${COLORS.panelLine}`,
+                borderRadius: 999,
+                padding: 3,
+              }}
+            >
+              {[
+                { id: "framed", label: "Dengan Bingkai" },
+                { id: "framed-live", label: "Bingkai + Live" },
+                { id: "liveview", label: "Live View" },
+              ].map((v) => {
+                const active = previewVariant === v.id;
+                const disabled =
+                  (v.id === "liveview" && !liveClipUrls.some(Boolean)) ||
+                  (v.id === "framed-live" && !hasFramedLiveClip());
+                return (
+                  <button
+                    key={v.id}
+                    onClick={() => !disabled && setPreviewVariant(v.id)}
+                    disabled={disabled}
+                    title={
+                      disabled
+                        ? "Belum ada rekaman live view untuk foto ini"
+                        : undefined
+                    }
+                    className="py-1.5 px-4"
+                    style={{
+                      background: active ? COLORS.gold : "transparent",
+                      color: disabled
+                        ? COLORS.panelLine
+                        : active
+                          ? COLORS.ink
+                          : COLORS.muted,
+                      border: "none",
+                      borderRadius: 999,
+                      fontFamily: SANS,
+                      fontSize: 11.5,
+                      letterSpacing: "0.04em",
+                      cursor: disabled ? "not-allowed" : "pointer",
+                      opacity: disabled ? 0.6 : 1,
+                    }}
+                  >
+                    {v.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {previewVariant === "liveview" && photos.length > 1 && (
+              <div className="flex flex-wrap justify-center gap-2 mt-4">
+                {photos.map((p, idx) => {
+                  const selected = previewLiveIndex === idx;
+                  const hasClip = !!(liveClipUrls[idx] || liveClipGifUrls[idx]);
+                  return (
+                    <button
+                      key={idx}
+                      onClick={() => setPreviewLiveIndex(idx)}
+                      className="w-12 h-12 overflow-hidden shrink-0 relative"
+                      style={{
+                        border: `2px solid ${selected ? COLORS.gold : "transparent"}`,
+                        opacity: hasClip ? 1 : 0.35,
+                        cursor: "pointer",
+                      }}
+                      title={
+                        hasClip
+                          ? `Live view foto ${idx + 1}`
+                          : `Belum ada rekaman live view untuk foto ${idx + 1}`
+                      }
+                    >
+                      <img
+                        src={p.url}
+                        alt={`foto ${idx + 1}`}
+                        className="w-full h-full object-cover block"
+                      />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <div
+              className="mt-3.5 p-3.5"
               style={{
                 background: COLORS.panel,
                 border: `1px solid ${COLORS.panelLine}`,
@@ -2714,9 +3597,79 @@ export default function LumiereBooth() {
                 <canvas
                   ref={previewCanvasRef}
                   className="w-full h-auto block"
+                  style={{
+                    display: previewVariant === "framed" ? "block" : "none",
+                  }}
                 />
+                {previewVariant === "framed-live" &&
+                  (framedLiveGifUrl ? (
+                    <img
+                      key={framedLiveGifUrl}
+                      src={framedLiveGifUrl}
+                      alt="Bingkai dengan live view hasil foto"
+                      className="w-full h-auto block"
+                    />
+                  ) : (
+                    <div
+                      className="w-full py-14 text-center px-4"
+                      style={{ fontSize: 12, color: COLORS.muted }}
+                    >
+                      {framedLiveGifGenerating
+                        ? "Menyusun bingkai + live view yang berputar terus…"
+                        : "Belum ada rekaman live view untuk foto pada bingkai ini."}
+                    </div>
+                  ))}
+                {previewVariant === "liveview" &&
+                  (liveClipGifUrls[previewLiveIndex] ? (
+                    <img
+                      key={liveClipGifUrls[previewLiveIndex]}
+                      src={liveClipGifUrls[previewLiveIndex]}
+                      alt="Live view (GIF) hasil foto"
+                      className="w-full h-auto block"
+                    />
+                  ) : liveClipUrls[previewLiveIndex] ? (
+                    <video
+                      key={liveClipUrls[previewLiveIndex]}
+                      src={liveClipUrls[previewLiveIndex]}
+                      className="w-full h-auto block"
+                      style={{
+                        transform: mirrorCapture ? "scaleX(-1)" : "none",
+                      }}
+                      autoPlay
+                      loop
+                      muted
+                      playsInline
+                      disablePictureInPicture
+                    />
+                  ) : (
+                    <div
+                      className="w-full py-14 text-center px-4"
+                      style={{ fontSize: 12, color: COLORS.muted }}
+                    >
+                      {liveClipSupported
+                        ? "Belum ada rekaman live view untuk foto ini."
+                        : "Rekaman live view (video) tidak didukung di browser ini."}
+                    </div>
+                  ))}
               </div>
             </div>
+            <p
+              className="text-center mt-2.5"
+              style={{ fontSize: 11, color: COLORS.muted }}
+            >
+              {previewVariant === "liveview"
+                ? gifGeneratingByIndex[previewLiveIndex] &&
+                  !liveClipGifUrls[previewLiveIndex]
+                  ? "Menyiapkan GIF yang berputar terus… (video dipakai dulu)"
+                  : liveClipGifUrls[previewLiveIndex]
+                    ? "GIF singkat saat foto diambil — otomatis berputar terus, tanpa bingkai."
+                    : "Video singkat saat foto diambil, tanpa bingkai."
+                : previewVariant === "framed-live"
+                  ? framedLiveGifUrl
+                    ? "GIF bingkai lengkap — layout sama seperti versi Dengan Bingkai, setiap foto di dalamnya berputar terus sebagai live view."
+                    : "Menyusun GIF bingkai lengkap dengan live view di setiap slot foto."
+                  : "Foto dengan filter di dalam bingkai pilihan Anda."}
+            </p>
 
             <div className="mt-auto pt-6 flex gap-2.5">
               <button
@@ -2772,6 +3725,57 @@ export default function LumiereBooth() {
               </span>
             </div>
 
+            <p
+              className="text-center mt-4"
+              style={{ fontSize: 11.5, color: COLORS.muted }}
+            >
+              Pilih salah satu tombol di bawah untuk mengunduh hasil foto Anda
+              ke perangkat.
+            </p>
+
+            <div className="grid grid-cols-2 gap-2.5 mt-3">
+              <button
+                onClick={handleDownload}
+                className="py-2.5 px-4 text-[11.5px] active:opacity-90"
+                style={btnGhost}
+              >
+                Unduh Versi Bingkai
+              </button>
+              <button
+                onClick={handleDownloadFramedLive}
+                disabled={!framedLiveGifUrl}
+                className="py-2.5 px-4 text-[11.5px] active:opacity-90 disabled:opacity-40 disabled:pointer-events-none"
+                style={btnGhost}
+              >
+                Unduh Bingkai + Live
+              </button>
+              <button
+                onClick={handleDownloadAllPhotos}
+                disabled={photos.length === 0}
+                className="py-2.5 px-4 text-[11.5px] active:opacity-90 disabled:opacity-40 disabled:pointer-events-none"
+                style={btnGhost}
+              >
+                Unduh Semua Foto ({photos.length})
+              </button>
+              <button
+                onClick={handleDownloadLiveView}
+                disabled={liveClipsAvailableCount() === 0}
+                className="py-2.5 px-4 text-[11.5px] active:opacity-90 disabled:opacity-40 disabled:pointer-events-none"
+                style={btnGhost}
+              >
+                Unduh Semua Live View ({liveClipsAvailableCount()})
+              </button>
+            </div>
+
+            <button
+              onClick={openPrintFlow}
+              className="w-full mt-2.5 flex items-center justify-center gap-2 py-2.5 px-4 text-[11.5px] active:opacity-90"
+              style={btnGhost}
+            >
+              Tambah Cetak Foto
+              <Printer size={14} />
+            </button>
+
             <div className="mt-auto pt-6">
               <button
                 onClick={fullReset}
@@ -2780,6 +3784,289 @@ export default function LumiereBooth() {
               >
                 Foto Lagi
                 <RotateCcw size={16} />
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* ============ SCREEN: CETAK — JUMLAH LEMBAR ============ */}
+        {step === "printQty" && (
+          <section className="flex flex-col flex-1 px-5 pt-6.5 pb-7 min-h-0">
+            <StepEyebrow>Cetak Foto</StepEyebrow>
+            <StepTitle>Berapa Lembar?</StepTitle>
+            <p
+              className="text-center mx-auto mt-2.5"
+              style={{
+                fontSize: 13.5,
+                lineHeight: 1.65,
+                color: COLORS.muted,
+                maxWidth: "34ch",
+              }}
+            >
+              Pilih jumlah lembar cetak yang Anda inginkan. Setiap lembar berisi
+              hasil foto lengkap dengan bingkai pilihan Anda.
+            </p>
+
+            <div
+              className="mt-5 mx-auto w-full flex items-center justify-center p-3"
+              style={{
+                maxWidth: 220,
+                background: COLORS.panel,
+                border: `1px solid ${COLORS.panelLine}`,
+              }}
+            >
+              {printImageUrl && (
+                <img
+                  src={printImageUrl}
+                  alt="Pratinjau cetak"
+                  className="w-full h-auto block"
+                />
+              )}
+            </div>
+
+            <div className="flex items-center justify-center gap-5 mt-7">
+              <button
+                onClick={() => setPrintQty((q) => Math.max(1, q - 1))}
+                className="w-11 h-11 flex items-center justify-center"
+                style={btnGhost}
+              >
+                −
+              </button>
+              <span
+                style={{
+                  fontFamily: SERIF,
+                  fontSize: 28,
+                  color: COLORS.goldSoft,
+                  minWidth: 40,
+                  textAlign: "center",
+                }}
+              >
+                {printQty}
+              </span>
+              <button
+                onClick={() =>
+                  setPrintQty((q) => Math.min(PRINT_QTY_MAX, q + 1))
+                }
+                className="w-11 h-11 flex items-center justify-center"
+                style={btnGhost}
+              >
+                +
+              </button>
+            </div>
+            <p
+              className="text-center mt-2"
+              style={{ fontSize: 10.5, color: COLORS.muted }}
+            >
+              Maks. {PRINT_QTY_MAX} lembar per sesi
+            </p>
+
+            <div className="flex flex-col items-center mt-6">
+              <span
+                style={{
+                  fontSize: 11.5,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  color: COLORS.muted,
+                }}
+              >
+                Total Bayar
+              </span>
+              <span
+                style={{
+                  fontFamily: SERIF,
+                  fontSize: 22,
+                  color: COLORS.goldSoft,
+                }}
+              >
+                Rp {(printQty * PRINT_PRICE_PER_COPY).toLocaleString("id-ID")}
+              </span>
+              <span
+                style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 2 }}
+              >
+                Rp {PRINT_PRICE_PER_COPY.toLocaleString("id-ID")} / lembar
+              </span>
+            </div>
+
+            <div className="mt-auto pt-6 flex gap-2.5">
+              <button
+                onClick={() => setStep("done")}
+                className="flex-1 py-3 px-4.5 text-[12.5px] active:opacity-90"
+                style={btnGhost}
+              >
+                Batal
+              </button>
+              <button
+                onClick={() => setStep("printPayment")}
+                className="flex-1 flex items-center justify-center gap-2 py-3 px-4.5 text-[12.5px] active:opacity-90"
+                style={btnSolid}
+              >
+                Lanjut Bayar
+                <ArrowRight size={16} />
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* ============ SCREEN: CETAK — PEMBAYARAN QRIS ============ */}
+        {step === "printPayment" && (
+          <section className="flex flex-col flex-1 px-5 pt-6.5 pb-7 min-h-0">
+            <StepEyebrow>Cetak Foto</StepEyebrow>
+            <StepTitle>Scan QRIS untuk Cetak</StepTitle>
+            <p
+              className="w-full text-center mx-auto mt-2.5"
+              style={{
+                fontSize: 13.5,
+                lineHeight: 1.65,
+                color: COLORS.muted,
+              }}
+            >
+              Pindai kode di bawah ini untuk membayar {printQty} lembar cetak.
+              Foto akan otomatis dikirim ke printer setelah pembayaran selesai.
+            </p>
+
+            <div
+              className="flex flex-col items-center mt-6 mx-auto w-full"
+              style={{
+                maxWidth: 300,
+                background: COLORS.ivory,
+                border: `1px solid ${COLORS.panelLine}`,
+                padding: "22px 18px",
+              }}
+            >
+              <div
+                className="flex items-center justify-between w-full mb-4"
+                style={{ fontFamily: SANS }}
+              >
+                <span
+                  style={{
+                    fontFamily: SERIF,
+                    fontStyle: "italic",
+                    fontSize: 17,
+                    color: COLORS.ink,
+                  }}
+                >
+                  Astár Booth
+                </span>
+                <span
+                  style={{
+                    fontSize: 10,
+                    letterSpacing: "0.14em",
+                    color: "#8a8a8a",
+                    fontWeight: 600,
+                  }}
+                >
+                  QRIS
+                </span>
+              </div>
+              <DummyQR seed={`astar-booth-print-${printQty}`} size={188} />
+              <div
+                className="mt-4 text-center"
+                style={{
+                  fontSize: 11,
+                  color: "#8a8a8a",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                NMID · ID10256987654 · Astár Booth
+              </div>
+            </div>
+
+            <div
+              className="flex flex-col items-center justify-between mt-5 mx-auto w-full"
+              style={{ maxWidth: 300 }}
+            >
+              <span
+                style={{
+                  fontSize: 11.5,
+                  letterSpacing: "0.08em",
+                  textTransform: "uppercase",
+                  color: COLORS.muted,
+                }}
+              >
+                Total Bayar · {printQty} Lembar
+              </span>
+              <span
+                style={{
+                  fontFamily: SERIF,
+                  fontSize: 20,
+                  color: COLORS.goldSoft,
+                }}
+              >
+                Rp {(printQty * PRINT_PRICE_PER_COPY).toLocaleString("id-ID")}
+              </span>
+            </div>
+
+            <div className="flex flex-col items-center justify-between mt-3">
+              <p
+                className="text-center"
+                style={{ fontSize: 11, color: COLORS.muted, maxWidth: "34ch" }}
+              >
+                *Simulasi pembayaran (dummy). Tidak ada transaksi nyata yang
+                diproses.
+              </p>
+            </div>
+
+            <div className="mt-auto pt-5.5 flex gap-2.5">
+              <button
+                onClick={() => setStep("printQty")}
+                className="flex-1 py-3 px-4.5 text-[12.5px] active:opacity-90"
+                style={btnGhost}
+              >
+                Kembali
+              </button>
+              <button
+                onClick={handlePrint}
+                className="flex-1 flex items-center justify-center gap-2 py-3 px-4.5 text-[13px] active:opacity-90"
+                style={btnSolid}
+              >
+                Sudah Bayar, Cetak
+                <Printer size={16} />
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* ============ SCREEN: CETAK — SEDANG DICETAK ============ */}
+        {step === "printDone" && (
+          <section className="flex flex-col flex-1 px-5 pt-6.5 pb-7 min-h-0">
+            <StepEyebrow>Cetak Foto</StepEyebrow>
+            <StepTitle>Sedang Mencetak…</StepTitle>
+            <div
+              className="flex flex-col items-center gap-3 mt-6 mx-auto w-full py-8"
+              style={{
+                maxWidth: 260,
+                background: COLORS.panel,
+                border: `1px solid ${COLORS.panelLine}`,
+              }}
+            >
+              <Printer size={34} color={COLORS.goldSoft} />
+              <p
+                className="text-center"
+                style={{
+                  fontSize: 12.5,
+                  color: COLORS.ivoryDim,
+                  lineHeight: 1.6,
+                }}
+              >
+                {printQty} lembar foto Anda sedang dikirim ke printer.
+              </p>
+            </div>
+
+            <div className="mt-auto pt-6 flex flex-col gap-2.5">
+              <button
+                onClick={openPrintFlow}
+                className="w-full py-3 px-5.5 text-[13px] active:opacity-90"
+                style={btnGhost}
+              >
+                Cetak Lagi
+              </button>
+              <button
+                onClick={() => setStep("done")}
+                className="w-full flex items-center justify-center gap-2 py-3 px-5.5 text-[13px] active:opacity-90"
+                style={btnSolid}
+              >
+                Selesai
+                <Check size={16} />
               </button>
             </div>
           </section>
@@ -3084,6 +4371,18 @@ export default function LumiereBooth() {
             </div>
           </div>
         )}
+
+        {/* ============ AREA CETAK (tersembunyi, hanya tampil saat print) ============
+            Diulang sebanyak printQty agar satu kali window.print() langsung
+            menghasilkan jumlah lembar yang diminta pengguna. */}
+        <div id="lb-print-area">
+          {printImageUrl &&
+            Array.from({ length: printQty }).map((_, i) => (
+              <div className="lb-print-page" key={i}>
+                <img src={printImageUrl} alt={`Cetak ${i + 1}`} />
+              </div>
+            ))}
+        </div>
       </div>
     </div>
   );
