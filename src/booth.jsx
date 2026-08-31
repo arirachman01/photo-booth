@@ -3498,9 +3498,10 @@ export default function LumiereBooth() {
               </p>
             </div>
 
-            {/* toggle: bingkai (framed, composited) vs live view (filtered
-                photo as taken, no frame) — determines what's shown below
-                and which version gets downloaded when "Simpan" is pressed */}
+            {/* toggle: bingkai (framed, composited) vs bingkai + live
+                (same layout, every slot playing its live clip) —
+                determines what's shown below and which version gets
+                downloaded when "Simpan" is pressed */}
             <div
               className="flex items-center justify-center gap-1 mt-4.5 mx-auto"
               style={{
@@ -3513,12 +3514,10 @@ export default function LumiereBooth() {
               {[
                 { id: "framed", label: "Dengan Bingkai" },
                 { id: "framed-live", label: "Bingkai + Live" },
-                { id: "liveview", label: "Live View" },
               ].map((v) => {
                 const active = previewVariant === v.id;
                 const disabled =
-                  (v.id === "liveview" && !liveClipUrls.some(Boolean)) ||
-                  (v.id === "framed-live" && !hasFramedLiveClip());
+                  v.id === "framed-live" && !hasFramedLiveClip();
                 return (
                   <button
                     key={v.id}
@@ -3526,7 +3525,7 @@ export default function LumiereBooth() {
                     disabled={disabled}
                     title={
                       disabled
-                        ? "Belum ada rekaman live view untuk foto ini"
+                        ? "Belum ada rekaman bingkai + live untuk foto ini"
                         : undefined
                     }
                     className="py-1.5 px-4"
@@ -3551,38 +3550,6 @@ export default function LumiereBooth() {
                 );
               })}
             </div>
-
-            {previewVariant === "liveview" && photos.length > 1 && (
-              <div className="flex flex-wrap justify-center gap-2 mt-4">
-                {photos.map((p, idx) => {
-                  const selected = previewLiveIndex === idx;
-                  const hasClip = !!(liveClipUrls[idx] || liveClipGifUrls[idx]);
-                  return (
-                    <button
-                      key={idx}
-                      onClick={() => setPreviewLiveIndex(idx)}
-                      className="w-12 h-12 overflow-hidden shrink-0 relative"
-                      style={{
-                        border: `2px solid ${selected ? COLORS.gold : "transparent"}`,
-                        opacity: hasClip ? 1 : 0.35,
-                        cursor: "pointer",
-                      }}
-                      title={
-                        hasClip
-                          ? `Live view foto ${idx + 1}`
-                          : `Belum ada rekaman live view untuk foto ${idx + 1}`
-                      }
-                    >
-                      <img
-                        src={p.url}
-                        alt={`foto ${idx + 1}`}
-                        className="w-full h-full object-cover block"
-                      />
-                    </button>
-                  );
-                })}
-              </div>
-            )}
 
             <div
               className="mt-3.5 p-3.5"
@@ -3620,56 +3587,17 @@ export default function LumiereBooth() {
                         : "Belum ada rekaman live view untuk foto pada bingkai ini."}
                     </div>
                   ))}
-                {previewVariant === "liveview" &&
-                  (liveClipGifUrls[previewLiveIndex] ? (
-                    <img
-                      key={liveClipGifUrls[previewLiveIndex]}
-                      src={liveClipGifUrls[previewLiveIndex]}
-                      alt="Live view (GIF) hasil foto"
-                      className="w-full h-auto block"
-                    />
-                  ) : liveClipUrls[previewLiveIndex] ? (
-                    <video
-                      key={liveClipUrls[previewLiveIndex]}
-                      src={liveClipUrls[previewLiveIndex]}
-                      className="w-full h-auto block"
-                      style={{
-                        transform: mirrorCapture ? "scaleX(-1)" : "none",
-                      }}
-                      autoPlay
-                      loop
-                      muted
-                      playsInline
-                      disablePictureInPicture
-                    />
-                  ) : (
-                    <div
-                      className="w-full py-14 text-center px-4"
-                      style={{ fontSize: 12, color: COLORS.muted }}
-                    >
-                      {liveClipSupported
-                        ? "Belum ada rekaman live view untuk foto ini."
-                        : "Rekaman live view (video) tidak didukung di browser ini."}
-                    </div>
-                  ))}
               </div>
             </div>
             <p
               className="text-center mt-2.5"
               style={{ fontSize: 11, color: COLORS.muted }}
             >
-              {previewVariant === "liveview"
-                ? gifGeneratingByIndex[previewLiveIndex] &&
-                  !liveClipGifUrls[previewLiveIndex]
-                  ? "Menyiapkan GIF yang berputar terus… (video dipakai dulu)"
-                  : liveClipGifUrls[previewLiveIndex]
-                    ? "GIF singkat saat foto diambil — otomatis berputar terus, tanpa bingkai."
-                    : "Video singkat saat foto diambil, tanpa bingkai."
-                : previewVariant === "framed-live"
-                  ? framedLiveGifUrl
-                    ? "GIF bingkai lengkap — layout sama seperti versi Dengan Bingkai, setiap foto di dalamnya berputar terus sebagai live view."
-                    : "Menyusun GIF bingkai lengkap dengan live view di setiap slot foto."
-                  : "Foto dengan filter di dalam bingkai pilihan Anda."}
+              {previewVariant === "framed-live"
+                ? framedLiveGifUrl
+                  ? "GIF bingkai lengkap — layout sama seperti versi Dengan Bingkai, setiap foto di dalamnya berputar terus sebagai live view."
+                  : "Menyusun GIF bingkai lengkap dengan live view di setiap slot foto."
+                : "Foto dengan filter di dalam bingkai pilihan Anda."}
             </p>
 
             <div className="mt-auto pt-6 flex gap-2.5">
