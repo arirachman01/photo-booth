@@ -7,9 +7,11 @@ import {
   ArrowRight,
   AlertCircle,
   QrCode,
-  Sparkles,
   Printer,
   FlipHorizontal,
+  Mail,
+  Loader2,
+  X,
 } from "lucide-react";
 import GIF from "gif.js";
 const GIFJS_WORKER_URL = new URL("gif.js/dist/gif.worker.js", import.meta.url)
@@ -28,10 +30,50 @@ const COLORS = {
   muted: "#8a8a8a",
 };
 
+const START_HERO = {
+  bg: "#0a0a0a",
+  line: "rgba(245,243,238,0.14)",
+  lineSoft: "rgba(245,243,238,0.07)",
+  ink: "#f5f3ee",
+  inkDim: "rgba(245,243,238,0.7)",
+  muted: "rgba(245,243,238,0.42)",
+  accent: "#c9a663",
+};
+
 const SERIF = '"Cormorant Garamond", serif';
 const SANS = '"Jost", sans-serif';
 
 const TOTAL_SHOTS = 6;
+
+/* ================= kirim hasil via email ================= */
+/* Endpoint backend yang menerima FormData berisi `email` + semua file
+   foto/gif dan benar-benar mengirimkan emailnya (mis. lewat Nodemailer,
+   SendGrid, Resend, dll). Browser tidak bisa mengirim email sendiri,
+   jadi endpoint ini WAJIB dibuat di sisi server — ganti path di bawah
+   sesuai backend yang dipakai. */
+const EMAIL_SEND_ENDPOINT = "/api/send-photos-email";
+
+/* validasi format email sederhana */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/* mengubah dataURL (base64) menjadi Blob, dipakai untuk melampirkan
+   foto/gif ke FormData sebelum dikirim ke endpoint email */
+function dataUrlToBlob(dataUrl) {
+  const [header, base64] = dataUrl.split(",");
+  const mimeMatch = /:(.*?);/.exec(header);
+  const mime = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+  const bin = atob(base64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+/* mengubah URL apapun (dataURL, blob:, atau URL biasa) menjadi Blob */
+async function anyUrlToBlob(url) {
+  if (url.startsWith("data:")) return dataUrlToBlob(url);
+  const res = await fetch(url);
+  return res.blob();
+}
 
 /* harga cetak fisik per lembar (dummy) */
 const PRINT_PRICE_PER_COPY = 15000;
@@ -48,6 +90,16 @@ const SESSION_TIME_LIMIT_SEC = 60;
 /* max width/height (px) a frame PNG is downscaled to before use — keeps
    canvas rendering fast even if someone drops in a huge source file */
 const MAX_FRAME_IMG_DIM = 1600;
+
+/* editable copy for SCREEN 1 (start screen) — overridden via the
+   customization panel and persisted through window.storage */
+const DEFAULT_START_SETTINGS = {
+  eyebrow: "Pangkalpinang · Photobooth Digital",
+  title: "Photobooth Kenangan",
+  subtitle:
+    "Ambil 6 foto, pilih filter & bingkai favoritmu, lalu bawa pulang hasilnya lewat QR code.",
+  buttonText: "Mulai",
+};
 
 /* ================= shared step header atoms ================= */
 function StepEyebrow({ children }) {
@@ -82,31 +134,6 @@ function StepTitle({ children }) {
     </h2>
   );
 }
-
-function PrimaryButton({ children, onClick, disabled, icon: Icon }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className="w-full mt-10 flex items-center justify-center gap-2 py-3 transition-opacity"
-      style={{
-        background: disabled ? COLORS.panelLine : COLORS.gold,
-        color: disabled ? COLORS.muted : COLORS.ink,
-        fontFamily: SANS,
-        fontSize: 13.5,
-        letterSpacing: "0.08em",
-        textTransform: "uppercase",
-        borderRadius: "12px",
-        opacity: disabled ? 0.6 : 1,
-        cursor: disabled ? "not-allowed" : "pointer",
-      }}
-    >
-      {children}
-      {Icon ? <Icon size={16} /> : null}
-    </button>
-  );
-}
-
 /* ================= geometry helpers (pure, canvas 2D) ================= */
 function roundRectPath(ctx, x, y, w, h, r) {
   if (!r) {
@@ -402,18 +429,13 @@ function detectTransparentRegions(
   }
 }
 
-/* ================= folder-based frame templates (Vite) =================
-   Drop any transparent PNG into src/assets/frames/ and it shows up
-   automatically as a built-in frame template — no code changes needed.
-   Transparent areas are auto-detected the same way as a "Buat Bingkai
-   Sendiri" upload, so photos land in the right spot on their own. */
-const FRAME_FOLDER_MODULES = import.meta.glob("./assets/frames/*.png", {
-  eager: true,
-});
+/* ================= folder-based frame templates (API) ================= */
+const FRAME_API_URL = "http://localhost:3000/frame-templates";
 
 function loadImageAsync(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    img.crossOrigin = "anonymous";
     img.onload = () => resolve(img);
     img.onerror = reject;
     img.src = src;
@@ -760,6 +782,12 @@ export default function LumiereBooth() {
   const [printQty, setPrintQty] = useState(1);
   const [printImageUrl, setPrintImageUrl] = useState(null);
 
+  /* ================= kirim hasil via email ================= */
+  const [showEmailModal, setShowEmailModal] = useState(false);
+  const [emailInput, setEmailInput] = useState("");
+  const [emailSendStatus, setEmailSendStatus] = useState("idle"); // idle | sending | success | error
+  const [emailSendError, setEmailSendError] = useState("");
+
   /* "live view" clips: a short recorded video (not a still) spanning the
      countdown + shutter, captured alongside EACH still photo. Indexed the
      same way as rawPhotos/photos (index i's clip belongs to photo i), so
@@ -767,15 +795,15 @@ export default function LumiereBooth() {
      session. */
   const [liveClipUrls, setLiveClipUrls] = useState([]);
   const [liveClipMimes, setLiveClipMimes] = useState([]);
-  const [liveClipSupported, setLiveClipSupported] = useState(
-    typeof window !== "undefined" && !!window.MediaRecorder,
-  );
+  // const [liveClipSupported, setLiveClipSupported] = useState(
+  //   typeof window !== "undefined" && !!window.MediaRecorder,
+  // );
   const mediaRecorderRef = useRef(null);
   const liveClipChunksRef = useRef([]);
 
   /* which photo's live view is currently shown/downloaded on the preview
      screen (and, while shooting, which slot a new recording belongs to) */
-  const [previewLiveIndex, setPreviewLiveIndex] = useState(0);
+  // const [previewLiveIndex, setPreviewLiveIndex] = useState(0);
 
   /* each video clip above also gets converted into a real animated GIF —
      GIFs loop forever wherever they're opened (chat apps, galleries,
@@ -784,7 +812,7 @@ export default function LumiereBooth() {
      stops, per photo; the video is kept as an automatic fallback if it
      fails. */
   const [liveClipGifUrls, setLiveClipGifUrls] = useState([]);
-  const [gifGeneratingByIndex, setGifGeneratingByIndex] = useState({});
+  // const [gifGeneratingByIndex, setGifGeneratingByIndex] = useState({});
   const gifGenTokensRef = useRef({}); // idx -> token, invalidates stale in-flight generations
 
   /* "bingkai + live" preview: the SAME frame/template layout as the normal
@@ -804,8 +832,8 @@ export default function LumiereBooth() {
   const sessionIntervalRef = useRef(null);
   const sessionExpiredRef = useRef(false); // guard so the auto-skip only fires once per session
 
-  /* frame templates auto-loaded from src/assets/frames/*.png (see
-     FRAME_FOLDER_MODULES) — treated as built-in, not user-editable */
+  /* frame templates auto-loaded from the frames API (see FRAME_API_URL)
+     — treated as built-in, not user-editable */
   const [folderTemplates, setFolderTemplates] = useState([]);
 
   /* user-created custom frame templates (persisted via window.storage) */
@@ -824,6 +852,14 @@ export default function LumiereBooth() {
   const [builderImageError, setBuilderImageError] = useState("");
   const [assetTick, setAssetTick] = useState(0); // bumped when an uploaded frame image finishes decoding
 
+  /* start screen (SCREEN 1) customization — persisted via window.storage */
+  const [startSettings, setStartSettings] = useState(DEFAULT_START_SETTINGS);
+  const [startBgImage, setStartBgImage] = useState(null); // data URL or null
+  const [startSettingsOpen, setStartSettingsOpen] = useState(false);
+  const [startDraft, setStartDraft] = useState(DEFAULT_START_SETTINGS);
+  const [startBgDraft, setStartBgDraft] = useState(null);
+  const [startBgError, setStartBgError] = useState("");
+
   const templates = useMemo(
     () => [
       ...BUILTIN_TEMPLATES,
@@ -835,23 +871,33 @@ export default function LumiereBooth() {
     [folderTemplates, customTemplates],
   );
 
-  /* load every PNG dropped into src/assets/frames/ once on mount */
+  /* load every frame served by the frames API once on mount */
   useEffect(() => {
     let cancelled = false;
-    const entries = Object.entries(FRAME_FOLDER_MODULES);
-    if (entries.length === 0) return;
     (async () => {
-      const results = await Promise.all(
-        entries.map(([path, mod]) => buildFolderFrameSpec(path, mod.default)),
-      );
-      if (cancelled) return;
-      const specs = results.filter(Boolean);
-      setFolderTemplates(
-        specs.map((spec) => ({
-          ...buildCustomTemplate(spec),
-          isCustom: false,
-        })),
-      );
+      try {
+        const res = await fetch(FRAME_API_URL);
+        if (!res.ok) {
+          throw new Error(`Gagal memuat daftar bingkai (status ${res.status})`);
+        }
+        const list = await res.json();
+        if (!Array.isArray(list) || list.length === 0) return;
+        const results = await Promise.all(
+          list.map((item) =>
+            buildFolderFrameSpec(item.path || item.name || item.url, item.url),
+          ),
+        );
+        if (cancelled) return;
+        const specs = results.filter(Boolean);
+        setFolderTemplates(
+          specs.map((spec) => ({
+            ...buildCustomTemplate(spec),
+            isCustom: false,
+          })),
+        );
+      } catch (e) {
+        console.log("Gagal memuat bingkai dari API:", e);
+      }
     })();
     return () => {
       cancelled = true;
@@ -923,6 +969,39 @@ export default function LumiereBooth() {
           }),
         );
         if (!cancelled) setCustomTemplates(hydrated);
+      } catch (e) {
+        console.log(e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /* load saved start-screen customization (text + background image) once */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!window.storage) return;
+      try {
+        const res = await window.storage.get("lumiere-start-settings", false);
+        if (!cancelled && res && res.value) {
+          const parsed = JSON.parse(res.value);
+          if (parsed && typeof parsed === "object") {
+            setStartSettings({ ...DEFAULT_START_SETTINGS, ...parsed });
+          }
+        }
+      } catch (e) {
+        console.log(e);
+      }
+      try {
+        const imgRes = await window.storage.get(
+          "lumiere-start-bg-image",
+          false,
+        );
+        if (!cancelled && imgRes && imgRes.value) {
+          setStartBgImage(imgRes.value);
+        }
       } catch (e) {
         console.log(e);
       }
@@ -1077,7 +1156,7 @@ export default function LumiereBooth() {
     setActiveSlotIndex(null);
     setRetakeIndex(null);
     setPreviewVariant("framed");
-    setPreviewLiveIndex(0);
+    // setPreviewLiveIndex(0);
     setMirrorCapture(true);
     setPrintQty(1);
     setPrintImageUrl(null);
@@ -1093,7 +1172,7 @@ export default function LumiereBooth() {
   async function generateLiveClipGif(videoBlobUrl, idx) {
     const myToken = (gifGenTokensRef.current[idx] || 0) + 1;
     gifGenTokensRef.current[idx] = myToken;
-    setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: true }));
+    // setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: true }));
     try {
       const video = document.createElement("video");
       video.muted = true;
@@ -1175,8 +1254,8 @@ export default function LumiereBooth() {
       console.log(e);
       // no GIF — the recorded video clip (with loop/autoplay) is still fine
     } finally {
-      if (gifGenTokensRef.current[idx] === myToken)
-        setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
+      // if (gifGenTokensRef.current[idx] === myToken)
+      //   setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
     }
   }
 
@@ -1409,10 +1488,10 @@ export default function LumiereBooth() {
 
   function startLiveClipRecording(idx) {
     const stream = streamRef.current;
-    if (!stream || !window.MediaRecorder) {
-      setLiveClipSupported(false);
-      return;
-    }
+    // if (!stream || !window.MediaRecorder) {
+    //   setLiveClipSupported(false);
+    //   return;
+    // }
     try {
       const mime = pickRecorderMimeType();
       liveClipChunksRef.current = [];
@@ -1443,10 +1522,10 @@ export default function LumiereBooth() {
       };
       rec.start();
       mediaRecorderRef.current = rec;
-      setLiveClipSupported(true);
+      // setLiveClipSupported(true);
     } catch (e) {
       console.log(e);
-      setLiveClipSupported(false);
+      // setLiveClipSupported(false);
     }
   }
 
@@ -1467,7 +1546,7 @@ export default function LumiereBooth() {
   function resetLiveClipSlot(idx) {
     gifGenTokensRef.current[idx] = (gifGenTokensRef.current[idx] || 0) + 1; // invalidate in-flight GIF gen for this slot
     stopLiveClipRecording();
-    setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
+    // setGifGeneratingByIndex((prev) => ({ ...prev, [idx]: false }));
     setLiveClipUrls((prev) => {
       if (!prev[idx]) return prev;
       const next = [...prev];
@@ -1489,7 +1568,7 @@ export default function LumiereBooth() {
     gifGenTokensRef.current = {};
     framedLiveGifTokenRef.current += 1; // invalidate any in-flight framed-live generation
     stopLiveClipRecording();
-    setGifGeneratingByIndex({});
+    // setGifGeneratingByIndex({});
     setLiveClipUrls((prev) => {
       prev.forEach((u) => u && URL.revokeObjectURL(u));
       return [];
@@ -1778,9 +1857,8 @@ export default function LumiereBooth() {
      recorded clip whenever the guest lands on the preview screen */
   useEffect(() => {
     if (step !== "preview") return;
-    const firstWithClip = liveClipUrls.findIndex((u) => !!u);
-    setPreviewLiveIndex(firstWithClip >= 0 ? firstWithClip : 0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // const firstWithClip = liveClipUrls.findIndex((u) => !!u);
+    // setPreviewLiveIndex(firstWithClip >= 0 ? firstWithClip : 0);
   }, [step]);
 
   /* size + render the read-only final preview canvas */
@@ -2154,6 +2232,99 @@ export default function LumiereBooth() {
     setStep("done");
   }
 
+  /* ================= kirim hasil via email ================= */
+  function openEmailModal() {
+    setEmailSendStatus("idle");
+    setEmailSendError("");
+    setShowEmailModal(true);
+  }
+
+  function closeEmailModal() {
+    if (emailSendStatus === "sending") return; // jangan tutup saat proses kirim
+    setShowEmailModal(false);
+  }
+
+  /* mengumpulkan semua hasil (foto bingkai, tiap foto, gif live view,
+     gif bingkai+live) lalu mengirimkannya ke EMAIL_SEND_ENDPOINT sebagai
+     lampiran, bersama alamat email tujuan yang diisi pengguna di popup */
+  async function handleSendEmail(e) {
+    e.preventDefault();
+    const email = emailInput.trim();
+    if (!EMAIL_RE.test(email)) {
+      setEmailSendStatus("error");
+      setEmailSendError("Masukkan alamat email yang valid.");
+      return;
+    }
+
+    setEmailSendStatus("sending");
+    setEmailSendError("");
+
+    try {
+      const T = currentTemplate();
+      const form = new FormData();
+      form.append("email", email);
+
+      // 1) foto hasil bingkai (komposisi akhir)
+      const framedOff = renderFinalOffscreenCanvas();
+      const framedBlob = await anyUrlToBlob(framedOff.toDataURL("image/png"));
+      form.append("files", framedBlob, `Astar-booth-${T.id}.png`);
+
+      // 2) gif bingkai + live (jika sudah selesai dibuat)
+      if (framedLiveGifUrl) {
+        const framedGifBlob = await anyUrlToBlob(framedLiveGifUrl);
+        form.append(
+          "files",
+          framedGifBlob,
+          `Astar-booth-bingkai-live-${T.id}.gif`,
+        );
+      }
+
+      // 3) setiap foto tunggal (tanpa bingkai)
+      for (let i = 0; i < photos.length; i++) {
+        const p = photos[i];
+        if (!p || !p.url) continue;
+        const photoBlob = await anyUrlToBlob(p.url);
+        form.append("files", photoBlob, `Astar-booth-foto-${i + 1}.jpg`);
+      }
+
+      // 4) setiap gif live view per foto (fallback ke klip video jika
+      //    gif belum selesai dibuat)
+      const totalClips = Math.max(liveClipUrls.length, liveClipGifUrls.length);
+      for (let i = 0; i < totalClips; i++) {
+        const gifUrl = liveClipGifUrls[i];
+        const clipUrl = liveClipUrls[i];
+        if (gifUrl) {
+          const gifBlob = await anyUrlToBlob(gifUrl);
+          form.append("files", gifBlob, `Astar-booth-liveview-${i + 1}.gif`);
+        } else if (clipUrl) {
+          const mime = liveClipMimes[i] || "video/webm";
+          const ext = mime.includes("mp4") ? "mp4" : "webm";
+          const clipBlob = await anyUrlToBlob(clipUrl);
+          form.append(
+            "files",
+            clipBlob,
+            `Astar-booth-liveview-${i + 1}.${ext}`,
+          );
+        }
+      }
+
+      const res = await fetch(EMAIL_SEND_ENDPOINT, {
+        method: "POST",
+        body: form,
+      });
+
+      if (!res.ok) throw new Error(`Gagal mengirim (status ${res.status})`);
+
+      setEmailSendStatus("success");
+    } catch (err) {
+      console.log(err);
+      setEmailSendStatus("error");
+      setEmailSendError(
+        "Gagal mengirim email. Periksa koneksi lalu coba lagi.",
+      );
+    }
+  }
+
   /* ================= cetak fisik (print) ================= */
   /* re-renders the framed photo as an image so it can be previewed and
      repeated in the hidden print area, then opens the quantity screen */
@@ -2355,6 +2526,91 @@ export default function LumiereBooth() {
     }
   }
 
+  /* ================= start-screen customization handlers ================= */
+  function openStartSettings() {
+    setStartDraft(startSettings);
+    setStartBgDraft(startBgImage);
+    setStartBgError("");
+    setStartSettingsOpen(true);
+  }
+
+  function closeStartSettings() {
+    setStartSettingsOpen(false);
+  }
+
+  function handleStartBgSelect(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!file.type || !file.type.startsWith("image/")) {
+      setStartBgError("File harus berupa gambar (JPG/PNG).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rawUrl = reader.result;
+      const probe = new Image();
+      probe.onload = () => {
+        const { width, height } = probe;
+        let finalUrl = rawUrl;
+        if (Math.max(width, height) > MAX_FRAME_IMG_DIM) {
+          const scale = MAX_FRAME_IMG_DIM / Math.max(width, height);
+          const w = Math.round(width * scale),
+            h = Math.round(height * scale);
+          const c = document.createElement("canvas");
+          c.width = w;
+          c.height = h;
+          c.getContext("2d").drawImage(probe, 0, 0, w, h);
+          finalUrl = c.toDataURL("image/jpeg", 0.9);
+        }
+        setStartBgError("");
+        setStartBgDraft(finalUrl);
+      };
+      probe.onerror = () =>
+        setStartBgError("Gagal membaca gambar. Coba file lain.");
+      probe.src = rawUrl;
+    };
+    reader.onerror = () => setStartBgError("Gagal membaca file.");
+    reader.readAsDataURL(file);
+  }
+
+  function handleResetStartSettings() {
+    setStartDraft(DEFAULT_START_SETTINGS);
+    setStartBgDraft(null);
+    setStartBgError("");
+  }
+
+  function handleSaveStartSettings() {
+    const cleaned = {
+      eyebrow: startDraft.eyebrow.trim() || DEFAULT_START_SETTINGS.eyebrow,
+      title: startDraft.title.trim() || DEFAULT_START_SETTINGS.title,
+      subtitle: startDraft.subtitle.trim() || DEFAULT_START_SETTINGS.subtitle,
+      buttonText:
+        startDraft.buttonText.trim() || DEFAULT_START_SETTINGS.buttonText,
+    };
+    setStartSettings(cleaned);
+    setStartBgImage(startBgDraft);
+    try {
+      if (window.storage) {
+        window.storage
+          .set("lumiere-start-settings", JSON.stringify(cleaned), false)
+          .catch(() => {});
+        if (startBgDraft) {
+          window.storage
+            .set("lumiere-start-bg-image", startBgDraft, false)
+            .catch(() => {});
+        } else {
+          window.storage
+            .delete("lumiere-start-bg-image", false)
+            .catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.log(err);
+    }
+    setStartSettingsOpen(false);
+  }
+
   /* live preview canvas inside the builder panel */
   useEffect(() => {
     if (!builderOpen) return;
@@ -2385,6 +2641,7 @@ export default function LumiereBooth() {
   ]);
 
   /* ================= derived UI bits ================= */
+  const isStartScreen = step === "start";
   const stepOrder = [
     "payment",
     "permission",
@@ -2394,20 +2651,11 @@ export default function LumiereBooth() {
     "frame",
     "preview",
   ];
-  const stepIdx = stepOrder.indexOf(step);
   const activeSlotState =
     activeSlotIndex !== null ? slotStates[activeSlotIndex] : null;
   const camMsgText =
     cameraStatus === "error" ? cameraErrorMsg : "Meminta akses kamera…";
   const showCamOverlay = cameraStatus !== "ready";
-  const sessionTimerActive = ["permission", "capture", "review"].includes(step);
-  const sessionTimerLow = sessionSecondsLeft <= 10;
-  const sessionTimerLabel = `${Math.floor(sessionSecondsLeft / 60)
-    .toString()
-    .padStart(
-      1,
-      "0",
-    )}:${(sessionSecondsLeft % 60).toString().padStart(2, "0")}`;
 
   /* ================= shared styles ================= */
   const btnBase = {
@@ -2430,12 +2678,17 @@ export default function LumiereBooth() {
     color: COLORS.ivoryDim,
     border: `1px solid ${COLORS.panelLine}`,
   };
-
+  const stepIdx = stepOrder.indexOf(step);
+  const sessionTimerActive = ["permission", "capture", "review"].includes(step);
+  const sessionTimerLow = sessionSecondsLeft <= 10;
+  const sessionTimerLabel = `${Math.floor(sessionSecondsLeft / 60)
+    .toString()
+    .padStart(
+      1,
+      "0",
+    )}:${(sessionSecondsLeft % 60).toString().padStart(2, "0")}`;
   return (
-    <div
-      className="min-h-dvh w-full flex items-start justify-center md:items-center md:py-6"
-      style={{ background: COLORS.bg, fontFamily: SANS, fontWeight: 300 }}
-    >
+    <div className="">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,500&family=Jost:wght@300;400;500;600&display=swap');
         .lb-scrollbar-none::-webkit-scrollbar{display:none;}
@@ -2450,6 +2703,8 @@ export default function LumiereBooth() {
         .lb-ring-spin{animation:lbSpin 40s linear infinite;transform-origin:100px 100px;}
         .lb-flash-pop{animation:lbFlashPop .35s ease;}
         .lb-cd-pop{animation:lbCdPop .9s ease;}
+        @keyframes lbSlowSpin{to{transform:rotate(360deg);}}
+        .lb-slow-ring{animation:lbSlowSpin 70s linear infinite;transform-origin:50% 50%;}
         input[type="range"].lb-range{accent-color:${COLORS.gold};}
         #lb-print-area{display:none;}
         @media print{
@@ -2463,41 +2718,18 @@ export default function LumiereBooth() {
       `}</style>
 
       <div
-        className="w-full max-w-220 min-h-dvh lg:min-h-200 flex flex-col relative md:rounded-2xl md:overflow-hidden"
-        style={{ background: COLORS.bg, boxShadow: "0 0 60px rgba(0,0,0,.12)" }}
+        className="w-full lg:min-h-dvh flex flex-col relative md:overflow-hidden"
+        style={{
+          background: isStartScreen ? START_HERO.bg : COLORS.bg,
+          boxShadow: "0 0 60px rgba(0,0,0,.12)",
+        }}
       >
         {/* ============ TOPBAR ============ */}
-        <div
-          className="flex items-center justify-between px-4.5 py-4 shrink-0"
-          style={{ borderBottom: `1px solid ${COLORS.panelLine}` }}
-        >
-          <div className="flex items-center gap-2.5">
-            <svg viewBox="0 0 40 40" fill="none" className="w-6 h-6">
-              <circle
-                cx="20"
-                cy="20"
-                r="18"
-                stroke={COLORS.gold}
-                strokeWidth="1.2"
-              />
-              <circle cx="20" cy="20" r="6" fill={COLORS.gold} />
-            </svg>
-            <span
-              style={{
-                fontFamily: SERIF,
-                fontSize: 19,
-                letterSpacing: "0.03em",
-                color: COLORS.ivory,
-              }}
-            >
-              Astár Booth
-            </span>
-          </div>
-
-          <div className="flex items-center gap-3">
+        {step !== "start" && (
+          <div className="flex items-center justify-between px-4.5 py-4 shrink-0">
             {sessionTimerActive && (
               <div
-                className="flex items-center gap-1.5 px-2.5 py-1"
+                className="flex items-center gap-1.5 px-2.5 py-1 ml-auto"
                 style={{
                   borderRadius: 999,
                   border: `1px solid ${sessionTimerLow ? "#c94f4f" : COLORS.panelLine}`,
@@ -2525,58 +2757,248 @@ export default function LumiereBooth() {
                 </span>
               </div>
             )}
-            {stepIdx >= 0 && (
-              <div className="flex items-center gap-1.5">
-                {stepOrder.map((s, i) => (
-                  <div
-                    key={s}
-                    style={{
-                      width: i === stepIdx ? 18 : 6,
-                      height: 6,
-                      borderRadius: 3,
-                      background:
-                        stepIdx >= 0 && i <= stepIdx
-                          ? COLORS.gold
-                          : COLORS.panelLine,
-                      transition: "all 200ms ease",
-                    }}
-                  />
-                ))}
-              </div>
-            )}
           </div>
-        </div>
-
+        )}
         {/* ============ SCREEN 1: START ============ */}
         {step === "start" && (
           <div
-            className="w-full h-full min-h-0 flex flex-col flex-1 items-center justify-center px-6 py-10"
-            style={{ background: COLORS.bg }}
+            className="w-full h-full min-h-0 flex flex-col flex-1 items-center justify-center px-6 py-10 relative overflow-hidden"
+            style={{
+              background: startBgImage
+                ? `linear-gradient(rgba(6,6,6,0.55), rgba(6,6,6,0.72)), url(${startBgImage})`
+                : START_HERO.bg,
+              backgroundSize: "cover",
+              backgroundPosition: "center",
+            }}
           >
-            <div className="w-full max-w-105">
-              <div className="flex flex-col items-center">
-                <Sparkles size={26} color={COLORS.gold} className="mb-4" />
-                <StepEyebrow>Astár Booth · Pangkalpinang</StepEyebrow>
-                <StepTitle>Photobooth Kenangan</StepTitle>
-                <p
-                  className="text-center mb-10"
+            {/* decorative layer — hidden once a custom photo is set, so it
+                never fights with the guest's own background image */}
+            {/* {!startBgImage && (
+              <>
+                <div
+                  className="absolute rounded-full"
                   style={{
-                    fontFamily: SANS,
-                    fontSize: 13.5,
-                    lineHeight: 1.7,
-                    color: COLORS.ivoryDim,
+                    width: "min(80vw,560px)",
+                    height: "min(80vw,560px)",
+                    top: "50%",
+                    left: "50%",
+                    transform: "translate(-50%,-50%)",
+                    border: `1px solid ${START_HERO.lineSoft}`,
+                    pointerEvents: "none",
+                  }}
+                />
+                <FilmStripDecor
+                  style={{
+                    position: "absolute",
+                    top: 22,
+                    left: 16,
+                    opacity: 0.07,
+                    transform: "rotate(-9deg)",
+                  }}
+                />
+                <FilmStripDecor
+                  style={{
+                    position: "absolute",
+                    top: 22,
+                    right: 16,
+                    opacity: 0.07,
+                    transform: "rotate(8deg)",
+                  }}
+                />
+                <FilmStripDecor
+                  style={{
+                    position: "absolute",
+                    bottom: 56,
+                    left: 12,
+                    opacity: 0.06,
+                    transform: "rotate(6deg)",
+                  }}
+                />
+                <FilmStripDecor
+                  style={{
+                    position: "absolute",
+                    bottom: 56,
+                    right: 12,
+                    opacity: 0.06,
+                    transform: "rotate(-7deg)",
+                  }}
+                />
+              </>
+            )} */}
+
+            <button
+              onClick={openStartSettings}
+              className="absolute top-4 right-4 z-10 flex items-center justify-center"
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: "10px",
+                background: "rgba(255,255,255,0.08)",
+                border: `1px solid ${START_HERO.line}`,
+                color: START_HERO.ink,
+                cursor: "pointer",
+              }}
+              aria-label="Kustomisasi tampilan"
+              title="Kustomisasi tampilan"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="w-4.5 h-4.5"
+                style={{ stroke: "currentColor" }}
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+
+            <div className="relative z-10 w-full max-w-105 flex flex-col items-center text-center">
+              <div
+                style={{
+                  fontSize: 11,
+                  letterSpacing: "0.24em",
+                  textTransform: "uppercase",
+                  color: START_HERO.muted,
+                }}
+              >
+                {startSettings.eyebrow}
+              </div>
+
+              {/* wordmark + circular "mulai" CTA, layered like a lens over the mark */}
+              <div className="relative flex flex-col items-center mt-5">
+                <div
+                  style={{
+                    fontFamily: SERIF,
+                    fontStyle: "italic",
+                    fontWeight: 500,
+                    fontSize: "clamp(52px,15vw,96px)",
+                    lineHeight: 0.84,
+                    color: START_HERO.ink,
+                    letterSpacing: "-0.01em",
                   }}
                 >
-                  Ambil 6 foto, pilih filter & bingkai favoritmu, lalu bawa
-                  pulang hasilnya lewat QR code.
-                </p>
-                <PrimaryButton
-                  onClick={() => setStep("payment")}
-                  icon={ArrowRight}
+                  Astár
+                </div>
+                <div
+                  style={{
+                    fontFamily: SANS,
+                    fontWeight: 600,
+                    fontSize: "clamp(22px,6.5vw,40px)",
+                    letterSpacing: "0.28em",
+                    color: START_HERO.ink,
+                    marginTop: 2,
+                  }}
                 >
-                  Mulai Sekarang
-                </PrimaryButton>
+                  BOOTH
+                </div>
+
+                <div
+                  className="absolute"
+                  style={{
+                    top: "50%",
+                    left: "50%",
+                    transform: "translate(-50%,-50%)",
+                    width: 150,
+                    height: 150,
+                    pointerEvents: "none",
+                  }}
+                >
+                  <svg
+                    className="lb-slow-ring"
+                    width="150"
+                    height="150"
+                    viewBox="0 0 150 150"
+                    style={{ display: "block" }}
+                  >
+                    <circle
+                      cx="75"
+                      cy="75"
+                      r="72"
+                      fill="none"
+                      stroke={START_HERO.line}
+                      strokeWidth="1"
+                      strokeDasharray="1 7"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </div>
+
+                <button
+                  onClick={() => setStep("payment")}
+                  className="absolute flex items-center justify-center text-center"
+                  style={{
+                    top: "50%",
+                    left: "50%",
+                    transform: "translate(-50%,-50%)",
+                    width: 118,
+                    height: 118,
+                    borderRadius: "999px",
+                    background: "rgba(8,8,8,0.88)",
+                    border: `1.5px solid ${START_HERO.accent}`,
+                    color: START_HERO.ink,
+                    fontFamily: SANS,
+                    fontWeight: 600,
+                    fontSize: 14.5,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    cursor: "pointer",
+                    padding: "0 14px",
+                    lineHeight: 1.3,
+                  }}
+                >
+                  {startSettings.buttonText}
+                </button>
               </div>
+
+              <div
+                className="mt-7"
+                style={{
+                  fontFamily: SANS,
+                  fontSize: 14.5,
+                  fontWeight: 500,
+                  color: START_HERO.inkDim,
+                }}
+              >
+                {startSettings.title}
+              </div>
+              <p
+                className="mt-2.5"
+                style={{
+                  fontFamily: SANS,
+                  fontSize: 12.5,
+                  lineHeight: 1.7,
+                  color: START_HERO.muted,
+                  maxWidth: 280,
+                }}
+              >
+                {startSettings.subtitle}
+              </p>
+            </div>
+
+            <div
+              className="absolute left-5 bottom-5 z-10"
+              style={{
+                fontSize: 10,
+                letterSpacing: "0.16em",
+                textTransform: "uppercase",
+                color: START_HERO.muted,
+              }}
+            >
+              Tanpa Aplikasi
+            </div>
+            <div
+              className="absolute right-5 bottom-5 z-10"
+              style={{
+                fontSize: 10,
+                letterSpacing: "0.16em",
+                textTransform: "uppercase",
+                color: START_HERO.muted,
+              }}
+            >
+              Cetak &amp; Unduh Instan
             </div>
           </div>
         )}
@@ -3516,8 +3938,7 @@ export default function LumiereBooth() {
                 { id: "framed-live", label: "Bingkai + Live" },
               ].map((v) => {
                 const active = previewVariant === v.id;
-                const disabled =
-                  v.id === "framed-live" && !hasFramedLiveClip();
+                const disabled = v.id === "framed-live" && !hasFramedLiveClip();
                 return (
                   <button
                     key={v.id}
@@ -3695,6 +4116,15 @@ export default function LumiereBooth() {
                 Unduh Semua Live View ({liveClipsAvailableCount()})
               </button>
             </div>
+
+            <button
+              onClick={openEmailModal}
+              className="w-full mt-2.5 flex items-center justify-center gap-2 py-2.5 px-4 text-[11.5px] active:opacity-90"
+              style={btnGhost}
+            >
+              Kirim via Email
+              <Mail size={14} />
+            </button>
 
             <button
               onClick={openPrintFlow}
@@ -4001,62 +4431,6 @@ export default function LumiereBooth() {
           </section>
         )}
 
-        <footer
-          className="flex items-center justify-center gap-3 px-4.5 pt-3.5 pb-4 shrink-0"
-          style={{ borderTop: `1px solid ${COLORS.panelLine}` }}
-        >
-          <svg
-            viewBox="0 0 40 40"
-            className="w-4.5 h-4.5 shrink-0"
-            style={{ opacity: 0.8 }}
-            fill="none"
-          >
-            <path
-              d="M20 8c8 0 14 8 14 16H6c0-8 6-16 14-16Z"
-              stroke="#111111"
-              strokeWidth="2.2"
-              strokeLinejoin="round"
-            />
-            <path
-              d="M20 10v14M14 12v12M26 12v12"
-              stroke="#111111"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-            />
-          </svg>
-          <p
-            className="text-center"
-            style={{
-              fontSize: 10,
-              letterSpacing: "0.14em",
-              textTransform: "uppercase",
-              color: COLORS.muted,
-            }}
-          >
-            Astár Booth — kenangan yang layak dibingkai
-          </p>
-          <svg
-            viewBox="0 0 40 40"
-            className="w-4.5 h-4.5 shrink-0"
-            style={{ opacity: 0.8 }}
-            fill="none"
-          >
-            <circle cx="20" cy="9" r="3" stroke="#111111" strokeWidth="2.2" />
-            <path
-              d="M20 12v20M12 20h16"
-              stroke="#111111"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-            />
-            <path
-              d="M12 24c0 5 4 8 8 8s8-3 8-8"
-              stroke="#111111"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-            />
-          </svg>
-        </footer>
-
         {/* ============ CUSTOM FRAME BUILDER OVERLAY ============ */}
         {builderOpen && (
           <div
@@ -4301,9 +4675,557 @@ export default function LumiereBooth() {
           </div>
         )}
 
-        {/* ============ AREA CETAK (tersembunyi, hanya tampil saat print) ============
-            Diulang sebanyak printQty agar satu kali window.print() langsung
-            menghasilkan jumlah lembar yang diminta pengguna. */}
+        {startSettingsOpen && (
+          <div
+            className="absolute inset-0 flex flex-col overflow-y-auto"
+            style={{ background: COLORS.bg, zIndex: 20 }}
+          >
+            <div
+              className="flex items-center justify-between px-4.5 py-4 shrink-0"
+              style={{ borderBottom: `1px solid ${COLORS.panelLine}` }}
+            >
+              <span
+                style={{ fontFamily: SERIF, fontSize: 18, color: COLORS.ivory }}
+              >
+                Kustomisasi Layar Awal
+              </span>
+              <button
+                onClick={closeStartSettings}
+                className="p-1.5"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: COLORS.muted,
+                  borderRadius: "8px",
+                }}
+                aria-label="Tutup"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                  style={{ stroke: COLORS.muted }}
+                >
+                  <path d="M18 6 6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="px-5 py-5 flex flex-col gap-5">
+              {/* live preview */}
+              <div
+                className="w-full flex items-center justify-center p-6 relative"
+                style={{
+                  minHeight: 200,
+                  background: startBgDraft
+                    ? `linear-gradient(rgba(6,6,6,0.55), rgba(6,6,6,0.72)), url(${startBgDraft})`
+                    : START_HERO.bg,
+                  backgroundSize: "cover",
+                  backgroundPosition: "center",
+                  border: `1px solid ${COLORS.panelLine}`,
+                }}
+              >
+                <div className="flex flex-col items-center">
+                  <div
+                    style={{
+                      fontSize: 10,
+                      letterSpacing: "0.2em",
+                      textTransform: "uppercase",
+                      color: START_HERO.muted,
+                    }}
+                  >
+                    {startDraft.eyebrow || DEFAULT_START_SETTINGS.eyebrow}
+                  </div>
+                  <div
+                    className="flex flex-col items-center"
+                    style={{ marginTop: 10 }}
+                  >
+                    <div
+                      style={{
+                        fontFamily: SERIF,
+                        fontStyle: "italic",
+                        fontWeight: 500,
+                        fontSize: 34,
+                        lineHeight: 0.84,
+                        color: START_HERO.ink,
+                      }}
+                    >
+                      Astár
+                    </div>
+                    <div
+                      style={{
+                        fontFamily: SANS,
+                        fontWeight: 600,
+                        fontSize: 13,
+                        letterSpacing: "0.28em",
+                        color: START_HERO.ink,
+                        marginTop: 2,
+                      }}
+                    >
+                      BOOTH
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      fontFamily: SANS,
+                      fontSize: 11.5,
+                      fontWeight: 500,
+                      color: START_HERO.inkDim,
+                      marginTop: 10,
+                      textAlign: "center",
+                    }}
+                  >
+                    {startDraft.title || DEFAULT_START_SETTINGS.title}
+                  </div>
+                  <div
+                    style={{
+                      fontFamily: SANS,
+                      fontSize: 11,
+                      color: START_HERO.muted,
+                      marginTop: 6,
+                      textAlign: "center",
+                      maxWidth: 260,
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    {startDraft.subtitle || DEFAULT_START_SETTINGS.subtitle}
+                  </div>
+                  <div
+                    className="flex items-center justify-center"
+                    style={{
+                      marginTop: 12,
+                      width: 56,
+                      height: 56,
+                      borderRadius: "999px",
+                      background: "rgba(8,8,8,0.88)",
+                      border: `1.5px solid ${START_HERO.accent}`,
+                      color: START_HERO.ink,
+                      fontFamily: SANS,
+                      fontWeight: 600,
+                      fontSize: 9.5,
+                      letterSpacing: "0.08em",
+                      textTransform: "uppercase",
+                      textAlign: "center",
+                      padding: "0 6px",
+                    }}
+                  >
+                    {startDraft.buttonText || DEFAULT_START_SETTINGS.buttonText}
+                  </div>
+                </div>
+              </div>
+
+              {/* background image */}
+              <div>
+                <label
+                  className="block mb-1.5"
+                  style={{
+                    fontSize: 11.5,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: COLORS.muted,
+                  }}
+                >
+                  Gambar Latar Belakang
+                </label>
+                <label
+                  className="w-full flex items-center justify-center gap-2 py-3 px-3 cursor-pointer"
+                  style={{
+                    background: "transparent",
+                    border: `1.5px dashed ${COLORS.gold}`,
+                    color: COLORS.goldSoft,
+                  }}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className="w-4 h-4"
+                    style={{ stroke: COLORS.goldSoft }}
+                  >
+                    <path d="M12 16V4m0 0 4 4m-4-4-4 4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+                  </svg>
+                  <span style={{ fontSize: 12.5 }}>
+                    {startBgDraft ? "Ganti Gambar" : "Pilih Gambar"}
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleStartBgSelect}
+                    className="hidden"
+                  />
+                </label>
+                {startBgDraft && (
+                  <button
+                    onClick={() => setStartBgDraft(null)}
+                    className="mt-2"
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "#d98a6b",
+                      fontSize: 11.5,
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                  >
+                    Hapus gambar latar
+                  </button>
+                )}
+                {startBgError && (
+                  <div
+                    className="mt-1.5"
+                    style={{ fontSize: 11, color: "#d98a6b" }}
+                  >
+                    {startBgError}
+                  </div>
+                )}
+                <p
+                  className="mt-2"
+                  style={{
+                    fontSize: 11,
+                    lineHeight: 1.5,
+                    color: COLORS.muted,
+                  }}
+                >
+                  Unggah foto untuk latar layar pembuka. Kosongkan untuk memakai
+                  latar polos default.
+                </p>
+              </div>
+
+              {/* eyebrow */}
+              <div>
+                <label
+                  className="block mb-1.5"
+                  style={{
+                    fontSize: 11.5,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: COLORS.muted,
+                  }}
+                >
+                  Label Kecil
+                </label>
+                <input
+                  type="text"
+                  value={startDraft.eyebrow}
+                  maxLength={60}
+                  onChange={(e) =>
+                    setStartDraft((d) => ({ ...d, eyebrow: e.target.value }))
+                  }
+                  placeholder={DEFAULT_START_SETTINGS.eyebrow}
+                  className="w-full py-2.5 px-3 outline-none"
+                  style={{
+                    background: COLORS.panel,
+                    border: `1px solid ${COLORS.panelLine}`,
+                    color: COLORS.ivory,
+                    fontFamily: SANS,
+                    fontSize: 13.5,
+                  }}
+                />
+              </div>
+
+              {/* title / tagline shown under the wordmark */}
+              <div>
+                <label
+                  className="block mb-1.5"
+                  style={{
+                    fontSize: 11.5,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: COLORS.muted,
+                  }}
+                >
+                  Tagline
+                </label>
+                <input
+                  type="text"
+                  value={startDraft.title}
+                  maxLength={60}
+                  onChange={(e) =>
+                    setStartDraft((d) => ({ ...d, title: e.target.value }))
+                  }
+                  placeholder={DEFAULT_START_SETTINGS.title}
+                  className="w-full py-2.5 px-3 outline-none"
+                  style={{
+                    background: COLORS.panel,
+                    border: `1px solid ${COLORS.panelLine}`,
+                    color: COLORS.ivory,
+                    fontFamily: SANS,
+                    fontSize: 13.5,
+                  }}
+                />
+              </div>
+
+              {/* subtitle */}
+              <div>
+                <label
+                  className="block mb-1.5"
+                  style={{
+                    fontSize: 11.5,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: COLORS.muted,
+                  }}
+                >
+                  Deskripsi
+                </label>
+                <textarea
+                  value={startDraft.subtitle}
+                  maxLength={200}
+                  rows={3}
+                  onChange={(e) =>
+                    setStartDraft((d) => ({ ...d, subtitle: e.target.value }))
+                  }
+                  placeholder={DEFAULT_START_SETTINGS.subtitle}
+                  className="w-full py-2.5 px-3 outline-none resize-none"
+                  style={{
+                    background: COLORS.panel,
+                    border: `1px solid ${COLORS.panelLine}`,
+                    color: COLORS.ivory,
+                    fontFamily: SANS,
+                    fontSize: 13.5,
+                    lineHeight: 1.6,
+                  }}
+                />
+              </div>
+
+              {/* button text */}
+              <div>
+                <label
+                  className="block mb-1.5"
+                  style={{
+                    fontSize: 11.5,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: COLORS.muted,
+                  }}
+                >
+                  Teks Tombol
+                </label>
+                <input
+                  type="text"
+                  value={startDraft.buttonText}
+                  maxLength={30}
+                  onChange={(e) =>
+                    setStartDraft((d) => ({
+                      ...d,
+                      buttonText: e.target.value,
+                    }))
+                  }
+                  placeholder={DEFAULT_START_SETTINGS.buttonText}
+                  className="w-full py-2.5 px-3 outline-none"
+                  style={{
+                    background: COLORS.panel,
+                    border: `1px solid ${COLORS.panelLine}`,
+                    color: COLORS.ivory,
+                    fontFamily: SANS,
+                    fontSize: 13.5,
+                  }}
+                />
+              </div>
+
+              <button
+                onClick={handleResetStartSettings}
+                className="self-start"
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: COLORS.muted,
+                  fontSize: 11.5,
+                  letterSpacing: "0.06em",
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+              >
+                Kembalikan ke Default
+              </button>
+            </div>
+
+            <div className="mt-auto px-5 pb-6 pt-2 flex gap-2.5">
+              <button
+                onClick={closeStartSettings}
+                className="flex-1 py-2.75 text-[12.5px]"
+                style={btnGhost}
+              >
+                Batal
+              </button>
+              <button
+                onClick={handleSaveStartSettings}
+                className="flex-1 py-2.75 text-[12.5px]"
+                style={btnSolid}
+              >
+                Simpan
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ============ POPUP: KIRIM HASIL VIA EMAIL ============ */}
+        {showEmailModal && (
+          <div
+            className="absolute inset-0 flex items-center justify-center px-5"
+            style={{ background: "rgba(0,0,0,0.55)", zIndex: 30 }}
+            onClick={closeEmailModal}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full flex flex-col"
+              style={{
+                maxWidth: 320,
+                background: COLORS.panel,
+                border: `1px solid ${COLORS.panelLine}`,
+                borderRadius: "14px",
+                padding: "22px 20px 20px",
+              }}
+            >
+              <div className="flex items-center justify-between">
+                <span
+                  style={{
+                    fontFamily: SERIF,
+                    fontSize: 19,
+                    color: COLORS.ivory,
+                  }}
+                >
+                  Kirim via Email
+                </span>
+                <button
+                  onClick={closeEmailModal}
+                  disabled={emailSendStatus === "sending"}
+                  className="p-1"
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: COLORS.muted,
+                    borderRadius: "8px",
+                  }}
+                  aria-label="Tutup"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              {emailSendStatus === "success" ? (
+                <>
+                  <p
+                    className="mt-3"
+                    style={{
+                      fontSize: 12.5,
+                      lineHeight: 1.6,
+                      color: COLORS.ivoryDim,
+                    }}
+                  >
+                    Semua foto dan gif hasil sesi kamu sudah dikirim ke{" "}
+                    <span style={{ color: COLORS.ivory }}>{emailInput}</span>.
+                    Cek juga folder spam jika belum masuk.
+                  </p>
+                  <button
+                    onClick={closeEmailModal}
+                    className="w-full mt-5 py-2.75 text-[12.5px]"
+                    style={btnSolid}
+                  >
+                    Tutup
+                  </button>
+                </>
+              ) : (
+                <form onSubmit={handleSendEmail} className="flex flex-col">
+                  <p
+                    className="mt-3"
+                    style={{
+                      fontSize: 12.5,
+                      lineHeight: 1.6,
+                      color: COLORS.muted,
+                    }}
+                  >
+                    Masukkan alamat email kamu — seluruh foto (versi bingkai
+                    &amp; foto satuan) dan gif live view akan dikirimkan ke
+                    sana.
+                  </p>
+
+                  <label
+                    className="block mt-4 mb-1.5"
+                    style={{
+                      fontSize: 11.5,
+                      letterSpacing: "0.1em",
+                      textTransform: "uppercase",
+                      color: COLORS.muted,
+                    }}
+                  >
+                    Alamat Email
+                  </label>
+                  <input
+                    type="email"
+                    inputMode="email"
+                    autoFocus
+                    value={emailInput}
+                    onChange={(e) => {
+                      setEmailInput(e.target.value);
+                      if (emailSendStatus === "error") {
+                        setEmailSendStatus("idle");
+                        setEmailSendError("");
+                      }
+                    }}
+                    placeholder="nama@email.com"
+                    disabled={emailSendStatus === "sending"}
+                    className="w-full py-2.5 px-3 outline-none"
+                    style={{
+                      background: COLORS.bg,
+                      border: `1px solid ${COLORS.panelLine}`,
+                      color: COLORS.ivory,
+                      fontFamily: SANS,
+                      fontSize: 13.5,
+                      borderRadius: "8px",
+                    }}
+                  />
+
+                  {emailSendStatus === "error" && emailSendError && (
+                    <div
+                      className="flex items-center gap-1.5 mt-2"
+                      style={{ fontSize: 11.5, color: "#d98a6b" }}
+                    >
+                      <AlertCircle size={13} />
+                      {emailSendError}
+                    </div>
+                  )}
+
+                  <div className="flex gap-2.5 mt-5">
+                    <button
+                      type="button"
+                      onClick={closeEmailModal}
+                      disabled={emailSendStatus === "sending"}
+                      className="flex-1 py-2.75 text-[12.5px] disabled:opacity-40"
+                      style={btnGhost}
+                    >
+                      Batal
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={emailSendStatus === "sending"}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-2.75 text-[12.5px] disabled:opacity-70"
+                      style={btnSolid}
+                    >
+                      {emailSendStatus === "sending" ? (
+                        <>
+                          <Loader2 size={14} className="animate-spin" />
+                          Mengirim…
+                        </>
+                      ) : (
+                        <>
+                          Kirim
+                          <Mail size={14} />
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </div>
+        )}
+
         <div id="lb-print-area">
           {printImageUrl &&
             Array.from({ length: printQty }).map((_, i) => (
