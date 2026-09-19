@@ -85,7 +85,7 @@ const PRINT_QTY_MAX = 20;
    permission/capture/review, we skip straight to the filter step and
    drop any retake/re-shoot in progress. If they reach the filter step
    before it runs out, the timer is simply cleared — normal flow. */
-const SESSION_TIME_LIMIT_SEC = 60;
+const SESSION_TIME_LIMIT_SEC = 5 * 60;
 
 /* max width/height (px) a frame PNG is downscaled to before use — keeps
    canvas rendering fast even if someone drops in a huge source file */
@@ -938,8 +938,6 @@ export default function LumiereBooth() {
     templatesRef.current = templates;
   }, [templates]);
 
-  console.log(templates);
-
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1668,7 +1666,7 @@ export default function LumiereBooth() {
     resetLiveClipSlot(shotIndex);
     startLiveClipRecording(shotIndex);
     setCountdownRunning(true);
-    let n = 3;
+    let n = 5;
     const tick = () => {
       setCountdownDisplay(n > 0 ? String(n) : "");
       setCountdownKey((k) => k + 1);
@@ -3537,11 +3535,11 @@ export default function LumiereBooth() {
             >
               <canvas
                 ref={filterPreviewCanvasRef}
-                className="w-full h-auto block"
+                className="w-[30%] mx-auto h-auto block"
               />
             </div>
 
-            <div className="flex gap-3 overflow-x-auto pt-4.5 px-0.5 pb-1.5 lb-scrollbar-none">
+            <div className="flex gap-3 overflow-x-auto pt-4.5 px-0.5 pb-1.5 lb-scrollbar-none mx-auto">
               {FILTERS.map((f) => {
                 const active = f.id === filterId;
                 return (
@@ -3985,7 +3983,7 @@ export default function LumiereBooth() {
               >
                 <canvas
                   ref={previewCanvasRef}
-                  className="w-full h-auto block"
+                  className="w-[20%] h-auto block"
                   style={{
                     display: previewVariant === "framed" ? "block" : "none",
                   }}
@@ -3996,11 +3994,11 @@ export default function LumiereBooth() {
                       key={framedLiveGifUrl}
                       src={framedLiveGifUrl}
                       alt="Bingkai dengan live view hasil foto"
-                      className="w-full h-auto block"
+                      className="w-[20%] h-auto block"
                     />
                   ) : (
                     <div
-                      className="w-full py-14 text-center px-4"
+                      className="w-[20%] py-14 text-center px-4"
                       style={{ fontSize: 12, color: COLORS.muted }}
                     >
                       {framedLiveGifGenerating
